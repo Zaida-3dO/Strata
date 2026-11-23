@@ -496,6 +496,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     cfg = json.loads(json.dumps(base))
     cfg["host"] = acc.host_for(s.access)
     cfg["port"] = int(s.port)
+    cfg.setdefault("idle_unload_s", 900)                    # local patch (Calliope, 2026-10-29): unload after 15 idle minutes, every launch
     if s.api_key:
         cfg["api_key"] = s.api_key
     elif s.no_key and s.access != "local":
