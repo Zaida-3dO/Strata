@@ -9,7 +9,9 @@ from serve import frontend
 
 class ReferenceParser(frontend.OutputParser):
     def _wrapped_call_end(self):
-        return frontend.call_end(self.buf)
+        # Parity is about the precheck/caching, not the rule: the reference always takes the full structural
+        # walk, but under the same name-check confirmer OutputParser uses (call_end(self.buf, self._props_of)).
+        return frontend.call_end(self.buf, self._props_of)
 
 
 def events_without_ids(events):
