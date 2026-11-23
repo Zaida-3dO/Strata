@@ -757,7 +757,7 @@ def _param_confirmer(props: dict, used: set):
             return pname in props and pname not in used
         if after.startswith(FUNC_END):
             tail = after[len(FUNC_END):].lstrip()
-            if not tail or CALL_END.startswith(tail) or tail.startswith((FUNC_START, PARAM_START)):
+            if not tail or CALL_END.startswith(tail) or tail.startswith((CALL_END, FUNC_START, PARAM_START)):
                 return True
             nxt = min((tail.find(t) for t in (CALL_START, FUNC_START, PARAM_END, FUNC_END) if t in tail), default=-1)
             if nxt < 0:
@@ -1884,8 +1884,8 @@ class OutputParser:
                 out.append(Event("content", self._track(rest)))
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:
-            out += self._scan(final=reason in (None, "stop"))   # ended inside an announced call; on a natural stop
-            # an undecided `
+            out += self._scan(final=reason in (None, "stop"))   # ended inside an announced call; on a natural
+            # stop an undecided `</function>` + prose candidate is settled by that final pass
             if self.ss == "function_done" and not self.buf[self.sp:].strip() and reason in (None, "stop"):
                 # A natural end immediately after </function> retains native streaming recovery.
                 out += self._close_scan()
