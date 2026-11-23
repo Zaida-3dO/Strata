@@ -62,7 +62,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve.frontend import (THINK_END, ChatTemplate, Event, OutputParser, anthropic_to_messages,  # noqa: E402
                             forced_call, images_of, literal_tags, mark_think_literals, openai_to_messages, require_messages,
-                            tool_choice_of, unmark_think_literals)
+                            tool_choice_of, unmark_think_literals, with_parse_only)
 from serve.mcp import McpCancelled, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from strata_control import engine_component  # noqa: E402
@@ -5598,9 +5598,10 @@ class Service:
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         if parser.unread:
             named = getattr(parser, "unread_names", None)
-            print(f"[strata] {parser.unread} <tool_call> block(s) in the answer did not read as a call of a declared "
-                  "tool and went back as text (a name the request did not declare, or a form the template does "
-                  "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else ""), flush=True)
+            print(f"[strata] {parser.unread} <tool_call> block(s) did not open a call of a tool this turn "
+                  "advertised (prose that names the format, a form the template does not use, or a name the request "
+                  "did not declare - the last stays a call the harness must answer)"
+                  + (f"; such names: {', '.join(named)}" if named else ""), flush=True)
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -7167,7 +7168,9 @@ def make_handler(svc: Service):
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
                                {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+            # as on the Anthropic route: parse-only names extend what the translator accepts, not what the model sees
+            chunks = openai_chunks(svc, req, ids, thinking, with_parse_only(tools, req), max_new, cancel, run=run,
+                                   force=force)
             if validator is not None:
                 chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
@@ -7401,7 +7404,10 @@ def make_handler(svc: Service):
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            # 2026-11-23: `parse_only_tool_names` (optional, ignored when absent) extends the names the TRANSLATOR
+            # accepts - the harness's full tool surface - while the prompt above was built from the advertised
+            # subset only: an exists-but-undeclared call becomes a real call, not printed text.
+            events = anthropic_events(svc, req, ids, thinking, with_parse_only(tools, req), max_new, cancel, force=force)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
                 return self._json(200, anthropic_collect(events))
