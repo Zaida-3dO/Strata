@@ -84,6 +84,7 @@ from serve.structured import StructuredOutputError, prepare_format, validated_js
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
+from serve.fairlock import FairLock  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -266,8 +267,13 @@ def focused_recovery_prompt(tok, ids, generated):
     return None
 
 
+def _queue_log(message: str) -> None:
+    print(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} queue: {message}", file=sys.stderr, flush=True)
+
+
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
+QUEUE_LOG_S = 5.0           # a request that waits this long for the single turn is named in the log, and again when it is admitted
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 # Anthropic clients add /v1/messages to their base URL themselves. A base URL that already ends in /v1 (copied from an OpenAI-style
 # setup) makes them post /v1/v1/messages; these two paths mean the same as the real ones. Nothing else is aliased.
@@ -3836,7 +3842,7 @@ class Service:
         self.shared_path = None                       # where they are kept between starts (next to the config)
         self.config_effort = None                     # #1641: the config's "reasoning_effort": the level for requests with none
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
-        self.fifo = threading.Lock()
+        self.fifo = FairLock()                        # the engine's single turn, handed over in the order requests arrived
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
@@ -4011,14 +4017,19 @@ class Service:
             with self.fifo:
                 yield
             return
-        while True:
-            if cancel is not None and cancel.is_set():
-                raise QueueCancelled("the client disconnected while waiting for the engine")
-            left = deadline - time.monotonic()
-            if left <= 0:
-                raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-            if self.fifo.acquire(timeout=min(0.1, left)):
-                break
+        place = self.fifo.enter()                       # one place in the line for the whole wait
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise QueueCancelled("the client disconnected while waiting for the engine")
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                if place.wait(min(0.1, left)):
+                    break
+        except BaseException:
+            place.cancel()
+            raise
         try:
             if cancel is not None and cancel.is_set():
                 raise QueueCancelled("the client disconnected while waiting for the engine")
@@ -4771,9 +4782,14 @@ class Service:
         if cancel is None:
             self.fifo.acquire()
         else:
-            while not self.fifo.acquire(timeout=0.25):
-                if cancel.is_set():
-                    raise ClientGone()
+            place = self.fifo.enter()
+            try:
+                while not place.wait(0.25):
+                    if cancel.is_set():
+                        raise ClientGone()
+            except BaseException:
+                place.cancel()
+                raise
         try:
             yield
         finally:
@@ -5198,24 +5214,40 @@ class Service:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
-                got = False
-                while not got:
-                    if cancel.is_set():
-                        raise QueueCancelled("the client disconnected while waiting for the engine")
-                    left = deadline - time.monotonic() if deadline is not None else QUEUE_BEAT_S
-                    if left <= 0:
-                        raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                    got = self.fifo.acquire(timeout=min(QUEUE_BEAT_S, left))
-                    if got:
+                place = self.fifo.enter()                   # one place in the line for the whole wait: arrival order
+                try:
+                    now = time.monotonic()
+                    began, beat_at, logged = now, now + QUEUE_BEAT_S, False
+                    while True:
                         if cancel.is_set():
-                            self.fifo.release()
                             raise QueueCancelled("the client disconnected while waiting for the engine")
-                        if deadline is not None and time.monotonic() >= deadline:
-                            self.fifo.release()
+                        now = time.monotonic()
+                        left = deadline - now if deadline is not None else QUEUE_BEAT_S
+                        if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                        turn.callback(self.fifo.release)
-                    else:
-                        yield "ping", None
+                        slice_s = min(beat_at - now, left, QUEUE_LOG_S - (now - began) if not logged else left)
+                        if place.wait(max(slice_s, 0.001)):
+                            break
+                        now = time.monotonic()
+                        if not logged and now - began >= QUEUE_LOG_S:
+                            logged = True
+                            _queue_log(f"request {request_id} has waited {now - began:.0f}s for the engine, "
+                                       f"{place.ahead()} ahead of it")
+                        if now >= beat_at:
+                            beat_at = now + QUEUE_BEAT_S
+                            yield "ping", None
+                except BaseException:
+                    place.cancel()
+                    raise
+                if cancel.is_set():
+                    self.fifo.release()
+                    raise QueueCancelled("the client disconnected while waiting for the engine")
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.fifo.release()
+                    raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+                turn.callback(self.fifo.release)
+                if logged:
+                    _queue_log(f"request {request_id} admitted after {time.monotonic() - began:.0f}s")
             with turn:
                 try:
                     with self.status_lock:

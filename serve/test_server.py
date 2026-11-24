@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from serve.fairlock import FairLock  # noqa: E402
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
@@ -4669,23 +4670,15 @@ class StatusHandover(unittest.TestCase):
                         second_running.set()        # the second request has its status and two tokens noted
                     yield t
 
-        class SlowRelease:
-            """A Lock whose release waits (briefly) until the thread it let in has started generating."""
+        class SlowRelease(FairLock):
+            """The turn, whose release waits (briefly) until the thread it let in has started generating."""
 
             def __init__(self):
-                self.lock, self.armed = threading.Lock(), False
-
-            def acquire(self, blocking=True, timeout=-1):
-                return self.lock.acquire(blocking, timeout)
-
-            def __enter__(self):
-                self.lock.acquire()
-
-            def __exit__(self, *exc):
-                self.release()
+                super().__init__()
+                self.armed = False
 
             def release(self):
-                self.lock.release()
+                super().release()
                 if self.armed:
                     self.armed = False
                     second_running.wait(5)
