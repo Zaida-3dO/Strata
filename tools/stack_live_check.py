@@ -9,8 +9,11 @@
     python tools/stack_live_check.py preempt [--reserve 5800] [--grace 0]
                                                              cut a long generation with POST /v1/vram preempt, retry it
 
---base (default http://127.0.0.1:18731), --key (or the STRATA_KEY variable, or the "key" in launch/solo.choices.json
-beside the install: never printed).  Every check prints PASS or FAIL for what it can see from outside; the server log
+Nothing is sent unless you say where: --base URL (a test or a spare server), or --live (the Solo server on
+http://127.0.0.1:18731, the one people are using; --base then replaces the address).  The key comes from --key or the
+STRATA_KEY variable; only with --live is the "key" in launch/solo.choices.json read as well (never printed).  The preempt
+check cuts the requests that are running, so it also needs --yes-cut-requests.  Run bare, the script prints this and exits
+with 2 without sending anything.  Every check prints PASS or FAIL for what it can see from outside; the server log
 (runtime/launch-solo.server.log) says the rest.  Nothing here changes a setting: preempt resizes the expert cache and
 grows it back at the end.
 """
@@ -25,16 +28,17 @@ import urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+LIVE_BASE = "http://127.0.0.1:18731"
 CHOICES = os.path.expandvars(r"%LOCALAPPDATA%\Strata\launch\solo.choices.json")
 
 
 class Api:
-    def __init__(self, base, key=None):
+    def __init__(self, base, key=None, read_live_key=False):
         u = urllib.parse.urlparse(base)
         self.host, self.port = u.hostname, u.port or 80
         if not key:
             key = os.environ.get("STRATA_KEY")
-        if not key and os.path.exists(CHOICES):
+        if not key and read_live_key and os.path.exists(CHOICES):
             key = json.load(open(CHOICES)).get("key")
         self.headers = {"Content-Type": "application/json"}
         if key:
@@ -275,7 +279,10 @@ def check_preempt(api, a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("check", choices=["fair", "messages", "loop", "penalty", "preempt"])
-    p.add_argument("--base", default="http://127.0.0.1:18731")
+    p.add_argument("--base", help="the server to test (nothing is sent without this or --live)")
+    p.add_argument("--live", action="store_true", help=f"the live Solo server at {LIVE_BASE}; also reads its key from launch/solo.choices.json")
+    p.add_argument("--yes-cut-requests", action="store_true", dest="yes_cut",
+                   help="preempt: allow it to cut the requests that are running on that server")
     p.add_argument("--key")
     p.add_argument("--tries", type=int, default=6)
     p.add_argument("--runs", type=int, default=3)
@@ -285,7 +292,15 @@ def main():
     p.add_argument("--reserve", type=int, default=5800)
     p.add_argument("--grace", type=float, default=0)
     a = p.parse_args()
-    api = Api(a.base, a.key)
+    if not (a.base or a.live):
+        print("Nothing was sent. Say where: --base URL for a test server, or --live for the live Solo server "
+              f"({LIVE_BASE}), which people may be using.", file=sys.stderr)
+        sys.exit(2)
+    if a.check == "preempt" and not a.yes_cut:
+        print("Nothing was sent. The preempt check cuts the requests running on the server; add --yes-cut-requests "
+              "when that is fine.", file=sys.stderr)
+        sys.exit(2)
+    api = Api(a.base or LIVE_BASE, a.key, read_live_key=a.live)
     fails = {"fair": check_fair, "messages": check_messages, "loop": check_loop, "penalty": check_penalty,
              "preempt": check_preempt}[a.check](api, a)
     sys.exit(1 if fails else 0)

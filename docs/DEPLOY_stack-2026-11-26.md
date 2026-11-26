@@ -87,6 +87,24 @@ python -c "import ast,sys;[ast.parse(open(f,encoding='utf-8').read()) for f in s
 Test-Path $OLD                                                                # True: the old folder is untouched
 ```
 
+Recursive compare, so a stale copied file cannot slip in: `$NEW\serve` must match the commit's `serve\` folder file for file
+(same names, same bytes; `__pycache__` is left out).
+
+```powershell
+git -C $REPO archive $SHA serve -o "$env:TEMP\serve-commit.tar"
+$CMP = "$env:TEMP\serve-commit"; Remove-Item $CMP -Recurse -Force -ErrorAction SilentlyContinue; New-Item -ItemType Directory $CMP | Out-Null
+tar -xf "$env:TEMP\serve-commit.tar" -C $CMP
+function Hashes($root) { Get-ChildItem $root -Recurse -File | Where-Object { $_.FullName -notmatch '__pycache__' } |
+    ForEach-Object { "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash, $_.FullName.Substring($root.Length) } | Sort-Object }
+Compare-Object (Hashes "$CMP\serve") (Hashes "$NEW\serve")                # prints nothing: same files, same bytes
+```
+The same in bash (Git Bash or Linux; `$NEW` is a path):
+```sh
+CMP=$(mktemp -d); git -C "$REPO" archive "$SHA" serve | tar -x -C "$CMP"
+diff -r -x __pycache__ "$CMP/serve" "$NEW/serve"                          # prints nothing
+```
+Any line either prints is a file that is missing, extra or different: re-run the `archive` and `tar` lines above and compare again.
+
 ## 3. Stop Strata, then prove nothing is left
 
 `launch --restart` does **nothing** when the same choices are already running, so the old code would keep serving and
@@ -119,10 +137,14 @@ Test-Path "$S\terminal\current\serve\fairlock.py"       # True
 A launch from a chat's shell lives in Helm's process tree and dies later without a log line (seen twice on 8 Nov), so it
 goes through WMI. **This is where the decision D1 lives (section 9): the default, and what this step does, is `vram_elastic` ON.**
 `--set vram-elastic` adds the engine's `--vram-elastic` flag; without it the preempt answers 400 `vram_not_elastic` and
-nothing is cut. (For a launch without it, leave `--set vram-elastic` out.)
+nothing is cut. **`--set` alone lasts for this start only** (`strata_cli/launch/cmd.py`: flags next to `--preset` change this start
+only; the preset file is written only when `--save-preset` is given, after the launch has run). So the command carries
+`--save-preset Solo`, which writes the choices, `vram-elastic` included, back to `launch\solo.choices.json`; that file is
+what the keepalive's `launch --preset Solo` reads. (For a launch without elastic, leave `--set vram-elastic` and
+`--save-preset Solo` out.)
 
 ```powershell
-$cmd = 'cmd.exe /c ""' + $STR + '" launch --preset Solo --set vram-elastic --yes --no-tui"'
+$cmd = 'cmd.exe /c ""' + $STR + '" launch --preset Solo --set vram-elastic --save-preset Solo --yes --no-tui"'
 $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $cmd }
 "{0} pid {1}" -f $r.ReturnValue, $r.ProcessId                                # 0 = created
 $up = $false
@@ -132,6 +154,19 @@ $up = $false
 $up                                                                            # True
 Select-String "$S\runtime\launch-solo.server.log" -Pattern "unloads after 900" | Select-Object -Last 1   # the idle-unload patch is on
 ```
+
+**Gate: elastic is kept for good, not just for this start.** Read the saved preset and prove a keepalive relaunch would start
+elastic (none of these starts anything):
+
+```powershell
+Select-String "$S\launch\solo.choices.json" -Pattern "vram-elastic"      # one line: "--vram-elastic" is in "extra"
+(Get-Item "$S\launch\solo.choices.json").LastWriteTime                    # just now (this launch wrote it)
+& $STR launch --preset Solo --plan                                        # changes nothing; read it for --vram-elastic
+```
+If the first line prints nothing, the choices were not saved: stop Strata and launch once more with the same command (check that
+`--save-preset Solo` is in it). The keepalive (and any reboot) runs `launch --preset Solo` with no `--set`, so that file is the
+only thing that keeps elastic on; step 8d.1 checks the running server (`"elastic": true`). Look at 8d.1 again after step 11
+(the task restarted) and after any reboot. (I think `--plan` lists the engine flags; the file line is the proof.)
 
 If it is not up after 6 minutes, read the last 40 lines of `runtime\launch-solo.server.log` and `launch\solo.engine.log`
 before doing anything else; an engine that does not know a flag fails here, and that is a rollback case (section 10).
@@ -149,17 +184,24 @@ Do all four; the first two cannot be satisfied by the old code.
 3. **A line only the new code prints.** After check 8a below the log has `queue: request <id> has waited 5s for the
    engine, K ahead of it`. (Also from the very first request after the launch: `GET /v1/status` answers; its `vram`
    block has `"elastic": true` when step 5's flag took.)
-4. **Preempt exists:** with the key in `$key` (never print it):
-   `$key = (Get-Content "$S\launch\solo.choices.json" | ConvertFrom-Json).key` then
-   `curl.exe -s -H "Authorization: Bearer $key" http://127.0.0.1:18731/props` has `"presence_penalty": 1.5` under
-   `default_generation_settings.params` (checked on a mock service with the model family set; the review says the old code
-   shows none). It reads the thinking defaults, so it is a sanity check; the proof is the wrap-up line in 8b.
+4. **The preempt fields exist** (proves the new `/v1/vram` code without cutting or resizing anything: the old code ignores fields it
+   does not know and would answer 200). With the key in `$key` (never print it):
+   ```powershell
+   $key = (Get-Content "$S\launch\solo.choices.json" | ConvertFrom-Json).key
+   curl.exe -s -w "`n%{http_code}`n" -H "Authorization: Bearer $key" -H "Content-Type: application/json" `
+       -d '{\"preempt_grace_s\": 5}' http://127.0.0.1:18731/v1/vram
+   ```
+   Expected: HTTP **400** and `{"error": {"type": "invalid_request_error", "message": "preempt_grace_s needs \"preempt\": true"}}`
+   (`serve/server.py`, the `/v1/vram` branch: a grace without `preempt: true` raises a `ValueError`, which becomes a 400 before the
+   engine is touched; the log has `400 invalid request: preempt_grace_s needs "preempt": true`). The body has no `reserve_mib` and no
+   `preempt`, so nothing can be resized or cut. A **200** means the old code answers. (`presence_penalty 1.5` under
+   `default_generation_settings.params` in `GET /props` is a separate sanity check of the loop close; its proof is the wrap-up line in 8b.)
 
 ## 7. Smoke test
 
 ```powershell
 $env:STRATA_KEY = $key
-python "$NEW\tools\stack_live_check.py" messages          # one thinking request on /v1/messages: end_turn, an answer, no error
+python "$NEW\tools\stack_live_check.py" messages --live   # one thinking request on /v1/messages: end_turn, an answer, no error
 ```
 and one ordinary chat from Helm on the local model. Look in the log for errors (`Select-String "$S\runtime\launch-solo.server.log" -Pattern "Traceback|rror" | select -Last 5`).
 **Gate: it answers, the speed is not obviously worse** (baseline from the memory on the 5090, Solo, IQ3_S: about 160-180 tok/s
@@ -168,12 +210,14 @@ for every request: `Get-Content "$S\launch\solo.engine.log" -Tail 6`).
 
 ## 8. Live checks (in this order; each one is PASS/FAIL, record the numbers on the board items)
 
-All use `tools\stack_live_check.py` (from the new folder, no dependencies, the key from `STRATA_KEY`). A request is any
+All use `tools\stack_live_check.py` (from the new folder, no dependencies). **It sends nothing unless you pass `--live` (the Solo
+server on 127.0.0.1:18731; only then is its key read from `solo.choices.json`) or `--base URL`; the preempt check also needs
+`--yes-cut-requests`. Every command below has `--live` already** (a bare run prints why and exits 2 without sending anything). A request is any
 chat from a client; Helm crews must not be running on the local model during checks 8a and 8d.
 
 **8a. Fair order** (item c9fdc6ff): one slow request and three waiters answer in arrival order.
 ```powershell
-python "$NEW\tools\stack_live_check.py" fair
+python "$NEW\tools\stack_live_check.py" fair --live
 Select-String "$S\runtime\launch-solo.server.log" -Pattern "queue: request" | Select-Object -Last 8
 ```
 PASS: the three waiters get their first text after the slow one ended, in the order W1, W2, W3; the log has
@@ -188,14 +232,14 @@ images takes a new place each time.
    identical but `presence_penalty 0` to match the old behaviour; the zeros loop hit 2 of 8 runs there). Run it until one loops:
    `python run_arms.py control 8 '{"presence_penalty": 0}'` in that folder (its `lf.py` points at Strata; edit the base
    URL/key there if needed), or the quick form from the new folder:
-   `python "$NEW\tools\stack_live_check.py" loop --tries 8 --presence-penalty 0 [--prompt-file the-task.txt]` (it names the first
+   `python "$NEW\tools\stack_live_check.py" loop --live --tries 8 --presence-penalty 0 [--prompt-file the-task.txt]` (it names the first
    try with a 200-character single-character run). To force one: `temperature 0 / top_k 1` plus `presence_penalty 0` on a
    prompt that makes the model count digits.
 2. *What PASS looks like.* The server log has
    `[strata] the thinking repeated one token ('0') 256 times in a row: wrapping up the thinking so the model answers (kept 8 of the 256 copies in its context)`,
    then a non-empty answer and finish `stop` (before: empty content, finish `length`, log `the reply repeated one token`).
    The answer must be sensible. A healthy request must **not** show the line (an ordinary thinking request: run
-   `python "$NEW\tools\stack_live_check.py" messages` again and grep the log).
+   `python "$NEW\tools\stack_live_check.py" messages --live` again and grep the log).
 3. *Judge the trim (decides, does not gate).* The engine's recurrent state cannot rewind, so the second pass may have to
    re-read all the thinking before the loop, not "a few tokens". Read the two prompt lines the loop request wrote:
    `Select-String "$S\launch\solo.engine.log" -Pattern "strata serve: prompt" | Select-Object -Last 4`
@@ -208,14 +252,14 @@ images takes a new place each time.
    *Spot check of `presence_penalty 1.5` on coding and tool calls* (the reviewer's medium finding: Qwen's own card says 0
    for precise coding; evidence for 1.5 is 8 runs on one task):
    ```powershell
-   python "$NEW\tools\stack_live_check.py" penalty --runs 3
+   python "$NEW\tools\stack_live_check.py" penalty --live --runs 3
    ```
    It runs a coding task and a tool call, 3 times each, with the default and with `presence_penalty 0`. PASS: both arms
    answer every time and the tool-call arguments parse. If the default arm is worse, or Ope would rather not: turn the
    penalty off without a code change: put `"sampling": {"presence_penalty": 0}` in the run config (or `POST /settings`, or send
    `presence_penalty: 0` per request); the loop close stays on. This is decision D2.
 
-**8c. The `/v1/messages` route end to end** (Claude Code's route). `python "$NEW\tools\stack_live_check.py" messages`
+**8c. The `/v1/messages` route end to end** (Claude Code's route). `python "$NEW\tools\stack_live_check.py" messages --live`
 (a thinking request: `stop_reason end_turn`, a text block, no `error` event, `message_stop` last) and, for the loop, the
 same loop request as 8b sent to `/v1/messages` with `thinking: {type: enabled}`. Then one real Claude Code turn on the local
 model with the harness that Helm uses (`tools-local\cc-env.sh` sets `ANTHROPIC_BASE_URL` and the key):
@@ -229,8 +273,8 @@ model with the harness that Helm uses (`tools-local\cc-env.sh` sets `ANTHROPIC_B
    it is off, read the reason (layer split, helper caches, HIP, segment under 64 MiB), stop 8d and report it.
 2. *Cut a long generation.*
    ```powershell
-   python "$NEW\tools\stack_live_check.py" preempt --reserve 5800
-   python "$NEW\tools\stack_live_check.py" preempt --reserve 5800 --grace 20     # with preempt_grace_s
+   python "$NEW\tools\stack_live_check.py" preempt --live --yes-cut-requests --reserve 5800
+   python "$NEW\tools\stack_live_check.py" preempt --live --yes-cut-requests --reserve 5800 --grace 20     # with preempt_grace_s
    ```
    It starts a long generation (retrying through `tools\strata_retry.py`), sends `POST /v1/vram {"reserve_mib": 5800, "preempt": true}`
    after 20 streamed events, prints the answer (`outcome`, `cut`, `turn_wait_ms`, `resize_ms`, `took_ms`), the retry, and grows the
@@ -251,6 +295,15 @@ model with the harness that Helm uses (`tools-local\cc-env.sh` sets `ANTHROPIC_B
 
 **8e.** Rollback criteria are in section 10.
 
+**Known limits to watch** (from the review; none is a rollback reason):
+
+- An MCP loop cut in round 2 can run tools twice: the client's retry sends the whole turn again, so a tool that already ran in the cut
+  round runs again. Watch for a doubled tool call after a cut during an MCP tool loop.
+- `--parallel` holders include the waiting requests, not only the running ones: with more than one slot the count can look
+  higher than the number of requests being answered.
+- A request that finishes in the same step as a preempt ends as a retryable error even though its answer was complete. Harmless: the
+  client sends it again and gets the answer from the prefix cache.
+
 ## 9. Decisions for Ope
 
 - **D1: `vram_elastic` on for good? Default: ON.** Needed for any preempt (the lease/release controller). The engine allocates the
@@ -258,8 +311,8 @@ model with the harness that Helm uses (`tools-local\cc-env.sh` sets `ANTHROPIC_B
   flag nothing changes"; with it: unknown, see check 7's speed). Where it lives: `launch\solo.choices.json` is the preset the
   keepalive's `launch --preset Solo` reads (`"extra"` holds `--vram-reserve-mib`, `--ple-io`, ...). `launch --set vram-elastic`
   (step 5) adds `"--vram-elastic"` to `extra` and rewrites `launch\solo.json` and `install\strata-iq3_s.json` (both derived, never
-  edit those two by hand). Check it stuck: `Select-String "$S\launch\solo.choices.json" -Pattern "vram-elastic"`. If the line is
-  missing, stop Strata and launch once with `--save-preset Solo` added to the step 5 command. **Without it in
+  edit those two by hand). Step 5 now carries `--save-preset Solo`, so it is saved; the check is in step 5's gate. If the line is
+  missing, stop Strata and launch once more with the step 5 command. **Without it in
   `solo.choices.json`, the next keepalive relaunch or reboot starts Strata without elastic and the preempt answers 400.** To turn
   it off for good: `--set vram-elastic=off` on a launch (and the same check), or restore `solo.choices.json.bak-20261126-stack`.
 - **D2: keep `presence_penalty 1.5` as the thinking default?** Decide after check 8b (coding + tool-call spot check). Default: keep;
