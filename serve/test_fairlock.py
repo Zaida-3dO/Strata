@@ -186,5 +186,32 @@ class ServiceQueueOrder(unittest.TestCase):
         self.assertFalse(svc.fifo.locked())
 
 
+class FairLockRank(unittest.TestCase):
+    """The preempt's place in the line (serve/fairlock.py): in front of waiters, behind the turn's holder."""
+
+    def test_ranks_order_the_line_and_never_take_the_turn_from_the_holder(self):
+        lock = FairLock()
+        lock.acquire()
+        a, b = lock.enter(), lock.enter()
+        again = lock.enter(1)                 # a request the server runs again
+        first, second = lock.enter(2), lock.enter(2)      # two preempts
+        self.assertTrue(lock.locked())
+        self.assertFalse(first.wait(0.01))                # not the holder: it waits for the release
+        order = []
+        for place, name in ((first, "preempt1"), (second, "preempt2"), (again, "again"), (a, "a"), (b, "b")):
+            lock.release()
+            self.assertTrue(place.wait(1), name)
+            order.append(name)
+        lock.release()
+        self.assertFalse(lock.locked())
+        self.assertEqual(order, ["preempt1", "preempt2", "again", "a", "b"])
+
+    def test_a_preempt_on_a_free_lock_takes_it_at_once(self):
+        lock = FairLock()
+        place = lock.enter(2)
+        self.assertTrue(place.wait(0))
+        lock.release()
+
+
 if __name__ == "__main__":
     unittest.main()

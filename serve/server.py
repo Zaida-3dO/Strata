@@ -409,6 +409,78 @@ class QueueCancelled(RuntimeError):
     """The client left before its first serial engine turn."""
 
 
+# POST /v1/vram with "preempt": true cuts the requests that hold the engine so the resize can run at once.  A cut
+# request must never look finished: it ends with an error a client retries (HTTP 529 overloaded_error on /v1/messages,
+# 503 on the other routes, an error event once a stream has begun), and one that had sent nothing yet is run again by
+# the server itself.  The cancel Event is the one a client disconnect sets too, so a cut is marked on the Event.
+PREEMPT_ATTR = "_strata_preempted"        # on the cancel Event: why the server (not the client) cancelled it
+GONE_ATTR = "_strata_gone"                # on the cancel Event: the client hung up (wins over a preempt mark)
+PREEMPT_RANK = 2                          # place in the fair line of a resize that preempts: ahead of everyone
+REQUEUE_RANK = 1                          # ... of a cut request the server runs again: ahead of ordinary waiters
+PREEMPT_REQUEUE_MAX = 3                   # how often the server runs one request again before it gives the error
+PREEMPT_RETRY_AFTER_S = 1                 # the Retry-After of a cut request: the resize takes tens of milliseconds
+PREEMPT_CODE = "vram_preempted"
+PREEMPT_REASON = "its VRAM was resized by a vram preempt (POST /v1/vram with preempt)"
+PREEMPT_POLL_S = 0.02                     # how often a waiting preempt cuts again (a request handed the turn meanwhile)
+
+
+def preempt_reason(cancel) -> str | None:
+    """Why `cancel` was set by a VRAM preempt, or None (not cut, or the client left too: nothing to answer)."""
+    if cancel is None or getattr(cancel, GONE_ATTR, False):
+        return None
+    return getattr(cancel, PREEMPT_ATTR, None)
+
+
+class RequestPreempted(RuntimeError):
+    """A request was cut by POST /v1/vram's preempt.  `retry_safe`: nothing of it reached the client (no event
+    yielded, no picture embeddings), so Service.run may run it again itself."""
+
+    def __init__(self, message: str, retry_safe: bool = False):
+        super().__init__(message)
+        self.retry_safe = retry_safe
+
+    def error(self, anthropic: bool = False) -> dict:
+        """The error object a route sends: names the cause and says when to retry.  Claude Code retries an
+        `overloaded_error` (Anthropic's 529); the other routes' clients retry a 5xx."""
+        return {"type": "overloaded_error" if anthropic else "server_error", "code": PREEMPT_CODE,
+                "message": str(self), "retry_after_s": PREEMPT_RETRY_AFTER_S}
+
+
+def preempted_message() -> str:
+    return (f"This request was cut because {PREEMPT_REASON}. Nothing is wrong with it: send the same request "
+            f"again after {PREEMPT_RETRY_AFTER_S} s (Retry-After).")
+
+
+class Holder:
+    """A request that holds the engine, as a VRAM preempt sees it: its id, whether any event of it reached the caller
+    (`sent`: then it can only be ended with an error) and whether content or a tool call did (`answered`)."""
+    __slots__ = ("id", "sent", "answered")
+
+    def __init__(self, ident: str):
+        self.id, self.sent, self.answered = ident, False, False
+
+
+class PreemptBusy(ModelBusy):
+    """A preempting resize did not get the turn in time (a slot save or an engine load holds it); `cut` requests were
+    cut meanwhile."""
+
+    def __init__(self, message: str, cut: int = 0):
+        super().__init__(message)
+        self.cut = cut
+
+
+class VramNotElastic(ValueError):
+    """A preempting resize on an engine that was not started with --vram-elastic: refused before anything is cut."""
+
+
+class VramResizeFailed(RuntimeError):
+    """The engine refused a resize after a preempt had cut the running requests: the reserve is unchanged."""
+
+    def __init__(self, message: str, cut: int = 0):
+        super().__init__(message)
+        self.cut = cut
+
+
 class EngineSilent(EngineDied):
     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
@@ -3917,6 +3989,9 @@ class Service:
         self.before_load_strict = False                  # #1997: refuse (503) whenever it fails
         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
         self.vram_reserve_asked = False                  # a POST /v1/vram was made (vram_reserve None is then asked)
+        self.turn_holders: dict[threading.Event, str] = {}   # the cancel Events of the requests that hold the engine
+        self.preempt_cuts = 0                            # requests a preempting resize cut (since the server started)
+        self.preempt_requeues = 0                        # ... and the ones the server ran again by itself
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
@@ -4004,6 +4079,7 @@ class Service:
     def note_client_disconnect(self, cancel: threading.Event) -> None:
         """Cancel once; count only work that was still queued or active when the client left."""
         with self.status_lock:
+            setattr(cancel, GONE_ATTR, True)             # a preempt's cut must not turn this into a retry
             if not cancel.is_set():
                 request_id = getattr(cancel, "_strata_request_id", None)
                 active = request_id in self.terminal_requests
@@ -4064,6 +4140,33 @@ class Service:
         for cancel in active:
             cancel.set()
         return len(active)
+
+    def hold(self, cancel: threading.Event, who: "Holder") -> None:
+        """`cancel`'s request now holds the engine: a VRAM preempt may cut it (and only such a request - one waiting
+        for its turn is not in this table)."""
+        with self.status_lock:
+            self.turn_holders[cancel] = who
+
+    def unhold(self, cancel: threading.Event) -> None:
+        with self.status_lock:
+            self.turn_holders.pop(cancel, None)
+
+    def preempt_cut(self, unanswered_only: bool = False) -> list[str]:
+        """Cut the requests that hold the engine now (POST /v1/vram's preempt): each one's cancel Event gets the preempt
+        mark and is set, so its generator stops at the next token and gives the turn up.  `unanswered_only`: only those
+        that have sent no content or tool call yet (nothing, or only thinking: the cheapest to cut - the server runs
+        one that sent nothing again by itself, and Claude Code retries one that sent only thinking).  A request
+        whose client left already, or that was cut before, is not counted again.  -> the cut requests' ids."""
+        cut = []
+        with self.status_lock:            # the same lock note_client_disconnect takes: one of the two wins, whole
+            for cancel, who in list(self.turn_holders.items()):
+                if cancel.is_set() or getattr(cancel, GONE_ATTR, False) or (unanswered_only and who.answered):
+                    continue
+                setattr(cancel, PREEMPT_ATTR, PREEMPT_REASON)
+                cancel.set()
+                cut.append(who.id)
+            self.preempt_cuts += len(cut)
+        return cut
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -4363,13 +4466,18 @@ class Service:
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
-    def vram(self, reserve_mib: int | None) -> dict:
+    def vram(self, reserve_mib: int | None, preempt: bool = False, grace_s: float = 0.0) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
         started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
         engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
-        An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+        An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}.
+        `preempt` (opt-in): the resize goes to the front of the line and the request that runs is cut, so it happens
+        at once; `grace_s` waits that long for the running request to end on its own first (see _vram_preempt).
+        Without `preempt` nothing here changes."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
+        if preempt:
+            return self._vram_preempt(reserve_mib, grace_s)
         if not self.fifo.acquire(timeout=self.vram_wait_s):
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
@@ -4379,20 +4487,101 @@ class Service:
             self.fifo.release()
             raise ModelBusy("a request is still running; try again when it has finished")
         try:
-            if not self.loaded():
-                self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-                return {"status": "not loaded", "reserve_mib": reserve_mib,
-                        "note": "applied when the model loads"}
-            # an elastic encoder that runs keeps its VRAM on top of the asked reserve
-            out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
-            self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
-            return {"status": "ok", **out}
+            return self._vram_apply(reserve_mib)
         finally:
             if ctl is not None:
                 ctl.release()
             self.fifo.release()
+
+    def _vram_apply(self, reserve_mib: int | None) -> dict:
+        """The resize itself; the caller holds the turn (self.fifo, and the engine's control lines in parallel mode)."""
+        if not self.loaded():
+            self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+            return {"status": "not loaded", "reserve_mib": reserve_mib,
+                    "note": "applied when the model loads"}
+        # an elastic encoder that runs keeps its VRAM on top of the asked reserve
+        out = self.engine.vram((reserve_mib or 0) + self.vision.elastic_mib if self.vision_held else reserve_mib)
+        self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
+        print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
+              f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+        return {"status": "ok", **out}
+
+    def _vram_preempt(self, reserve_mib: int | None, grace_s: float = 0.0) -> dict:
+        """POST /v1/vram with "preempt": true: the resize does not wait for the request that runs.  It takes the front of
+        the line (ahead of every waiting request, which keeps its place and runs after it), cuts the requests that hold
+        the engine (each one ends with a retryable error, or is run again by the server if nothing of it was sent), and
+        resizes the moment the turn is free - the turn is only ever handed over between engine steps, after the cut
+        request's generator has stopped the engine and drained its DONE.  The answer says how many requests were cut
+        and how long each part took.  `grace_s` (0: cut at once): a request that has sent no content yet (nothing, or
+        only thinking) is cut at once - the server runs one that sent nothing again, unseen, and a client such as
+        Claude Code retries one that sent only thinking - but one that is streaming content gets that many seconds to
+        end on its own first, because a cut after content is lost work (and a truncated answer for a client that does
+        not retry).  An engine that cannot resize (no --vram-elastic) is refused first, with nothing cut.  If the
+        engine refuses the resize after the cut, the reserve stays as it was (VramResizeFailed) and the cut requests
+        retry against the unchanged cache."""
+        t0 = time.monotonic()
+        info = getattr(self.engine, "info", None) or {}
+        if self.loaded() and not info.get("vram_elastic"):
+            raise VramNotElastic("preempt needs an engine started with --vram-elastic (the config's \"vram_elastic\": "
+                                 "true); nothing was cut")
+        cut: list[str] = []
+
+        def cut_more():
+            # within the grace only what has sent no content yet is cut; after it, everything that holds the engine
+            cut.extend(w for w in self.preempt_cut(unanswered_only=time.monotonic() < t0 + grace_s) if w not in cut)
+
+        deadline = t0 + max(self.vram_wait_s, grace_s)
+        place = self.fifo.enter(PREEMPT_RANK)
+        busy = False                                    # something held the turn when the preempt came
+        try:
+            while not place.wait(0):
+                busy = True
+                cut_more()
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise PreemptBusy("the engine's turn is held by something that cannot be cut (a session save or "
+                                      f"an engine load); try again when it has finished ({len(cut)} request(s) were "
+                                      "cut meanwhile)", len(cut))
+                if place.wait(min(PREEMPT_POLL_S, left)):
+                    break
+        except BaseException:
+            place.cancel()
+            raise
+        got_turn = time.monotonic()
+        batch = bool(getattr(self.engine, "batch", 0))
+        ctl = getattr(self.engine, "ctl", None) if batch else None
+        try:
+            if ctl is not None:                         # parallel requests do not hold the turn: cut until the control lines are free
+                while not ctl.acquire(timeout=PREEMPT_POLL_S):
+                    cut_more()
+                    if time.monotonic() >= deadline:
+                        raise PreemptBusy("the engine's control lines stayed busy; try again when the running "
+                                          f"requests have finished ({len(cut)} request(s) were cut meanwhile)", len(cut))
+            try:
+                out = None
+                for attempt in range(50 if batch else 1):      # the engine refuses a resize while a slot still decodes
+                    try:
+                        out = self._vram_apply(reserve_mib)
+                        break
+                    except ValueError:
+                        if not batch or attempt == 49:
+                            raise
+                        cut_more()
+                        time.sleep(PREEMPT_POLL_S)
+            except ValueError as e:
+                raise VramResizeFailed(str(e), len(cut)) from e
+            finally:
+                if ctl is not None:
+                    ctl.release()
+        finally:
+            self.fifo.release()
+        done = time.monotonic()
+        took = {"outcome": "cut" if cut else "waited" if busy else "nothing running",
+                "cut": len(cut), "cut_ids": cut, "grace_s": grace_s, "turn_wait_ms": round((got_turn - t0) * 1000),
+                "resize_ms": round((done - got_turn) * 1000), "took_ms": round((done - t0) * 1000)}
+        print(f"[strata] VRAM preempt ({took['outcome']}): cut {len(cut)} request(s), the turn came after "
+              f"{took['turn_wait_ms']} ms, the resize took {took['resize_ms']} ms", flush=True)
+        return {**out, "preempt": took}
 
     def _say_died(self, e: Exception) -> None:
         """The server window's line for an engine that died (or was ended, #481) in the middle of a request."""
@@ -4776,11 +4965,14 @@ class Service:
             self.tok.encode(prompt, parse_special=True)
 
     @contextlib.contextmanager
-    def _turn(self, cancel=None):
+    def _turn(self, cancel=None, cuttable=False):
         """The engine's single turn (self.fifo) for an image encode.  #1999: a client that leaves while this request
-        waits for it gives its place up (ClientGone), as a queued generation does (#1619)."""
+        waits for it gives its place up (ClientGone), as a queued generation does (#1619).  `cuttable`: a VRAM preempt
+        may cut the encode while it holds the turn (it stops between pictures and raises ClientGone, which the route
+        answers with the retryable error).  Image generation and the other holders of the turn are not cut."""
         if cancel is None:
             self.fifo.acquire()
+            cuttable = False
         else:
             place = self.fifo.enter()
             try:
@@ -4790,9 +4982,13 @@ class Service:
             except BaseException:
                 place.cancel()
                 raise
+        if cuttable:
+            self.hold(cancel, Holder("image-encode"))
         try:
             yield
         finally:
+            if cuttable:
+                self.unhold(cancel)
             self.fifo.release()
 
     def _note_unreadable_tool_images(self, messages, cancel=None):
@@ -4819,7 +5015,7 @@ class Service:
                             raise ValueError("offline mode cannot download an image URL")
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
-                        with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                        with self._turn(cancel, cuttable=True):  # the encoder takes its turn with the requests (see below)
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
@@ -4867,7 +5063,7 @@ class Service:
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
-            with self._turn(cancel):
+            with self._turn(cancel, cuttable=True):
                 self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
@@ -5086,13 +5282,32 @@ class Service:
         if ka is not None:
             ka.acquire()
         try:
-            yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only)
+            rank, again = 0, 0
+            while True:
+                try:
+                    yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, rank)
+                    return
+                except RequestPreempted as e:
+                    # a VRAM preempt cut this request before anything of it reached the caller: run it again here,
+                    # at the front of the line behind the resize, so the client only sees a longer wait
+                    if not e.retry_safe or again >= PREEMPT_REQUEUE_MAX:
+                        raise
+                    with self.status_lock:             # against a client that leaves at this very moment
+                        if getattr(cancel, GONE_ATTR, False):
+                            raise
+                        cancel.clear()
+                        setattr(cancel, PREEMPT_ATTR, None)
+                        self.preempt_requeues += 1
+                    again += 1
+                    rank = REQUEUE_RANK
+                    print(f"[strata] a VRAM preempt cut this request before it sent anything: it runs again "
+                          f"({again}/{PREEMPT_REQUEUE_MAX})", flush=True)
         finally:
             if ka is not None:
                 ka.release()
 
     def _run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-             declared_only=False) -> Iterator[tuple[str, object]]:
+             declared_only=False, rank=0) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -5183,6 +5398,7 @@ class Service:
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         request_id = uuid.uuid4().hex[:12]
+        me = Holder(request_id)      # what a VRAM preempt may ask about this request: did an event reach the caller
         setattr(cancel, "_strata_request_id", request_id)
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
@@ -5214,7 +5430,7 @@ class Service:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
-                place = self.fifo.enter()                   # one place in the line for the whole wait: arrival order
+                place = self.fifo.enter(rank)               # one place in the line for the whole wait: arrival order
                 try:
                     now = time.monotonic()
                     began, beat_at, logged = now, now + QUEUE_BEAT_S, False
@@ -5248,6 +5464,8 @@ class Service:
                 turn.callback(self.fifo.release)
                 if logged:
                     _queue_log(f"request {request_id} admitted after {time.monotonic() - began:.0f}s")
+            self.hold(cancel, me)                           # from here on a VRAM preempt may cut this request
+            turn.callback(self.unhold, cancel)              # (runs before the turn is handed on)
             with turn:
                 try:
                     with self.status_lock:
@@ -5287,6 +5505,7 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     for ev in opening:
+                        me.sent = True
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
@@ -5344,7 +5563,8 @@ class Service:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
-                                        answered = True
+                                        answered = me.answered = True
+                                    me.sent = True
                                     yield "event", ev
                                 if evs:
                                     last_out = time.perf_counter()
@@ -5469,6 +5689,7 @@ class Service:
                                     evs = cut(parser.feed(detok.push(t)))
                                     self._note(n, evs, st, rate)
                                     for ev in evs:
+                                        me.sent = True
                                         yield "event", ev
                                 prompt = prompt + seg + extra
                                 finish = "length"
@@ -5499,6 +5720,7 @@ class Service:
                             evs = cut(parser.feed(detok.push(t)))
                             self._note(n, evs, st, rate)
                             for ev in evs:
+                                me.sent = True
                                 yield "event", ev
                         if stops is not None and stops.hit is not None:
                             finish = "stop"
@@ -5599,11 +5821,20 @@ class Service:
                                 self.status.update(busy=False)
                                 self.status.pop("tail", None)
                                 self.status.pop("tool", None)
+            # The turn is handed on by now.  A request a VRAM preempt cut is never an answer that ends: it raises, and
+            # Service.run runs it again (nothing of it sent yet) or the route answers the retryable error.
+            if finish == "cancel" and preempt_reason(cancel):
+                raise RequestPreempted(preempted_message(), retry_safe=not me.sent and not emb)
         except QueueCancelled:
             finish = "cancel"
+            if preempt_reason(cancel):      # cut while it held the turn for a picture's encode, then waited again
+                raise RequestPreempted(preempted_message(), retry_safe=False)
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                            "reasoning_tokens": 0, "reasoning_recoveries": 0}
             return
+        except RequestPreempted:
+            finish = "cancel"
+            raise
         except QueueWaitExpired:
             finish = "timeout"
             with self.status_lock:
@@ -6312,7 +6543,9 @@ def make_handler(svc: Service):
             sock = self.connection
 
             def watch():
-                while not done.wait(0.5) and not cancel.is_set():
+                # a cancel a VRAM preempt set does not end the watch: the client may still leave, and the server may
+                # clear the cancel and run the request again
+                while not done.wait(0.5) and (not cancel.is_set() or getattr(cancel, PREEMPT_ATTR, None)):
                     try:
                         readable, _, _ = select.select([sock], [], [], 0)
                         gone = bool(readable) and sock.recv(1, socket.MSG_PEEK) == b""
@@ -6847,8 +7080,23 @@ def make_handler(svc: Service):
                     r = req.get("reserve_mib")
                     if r is not None and (isinstance(r, bool) or not isinstance(r, int) or r < 0):
                         raise ValueError("reserve_mib: a whole number of MiB (0 or more), or null for the start's")
+                    preempt = req.get("preempt", False)         # opt-in: cut the running request so the resize is at once
+                    if not isinstance(preempt, bool):
+                        raise ValueError("preempt: true or false")
+                    grace = req.get("preempt_grace_s", 0)       # ... after waiting this long for it to end on its own
+                    if isinstance(grace, bool) or not isinstance(grace, (int, float)) or not 0 <= grace <= svc.vram_wait_s:
+                        raise ValueError(f"preempt_grace_s: seconds to wait before cutting a streaming request "
+                                         f"(0 to {svc.vram_wait_s:g})")
+                    if grace and not preempt:
+                        raise ValueError("preempt_grace_s needs \"preempt\": true")
                     try:
-                        self._json(200, svc.vram(r))
+                        self._json(200, svc.vram(r, preempt=True, grace_s=float(grace)) if preempt else svc.vram(r))
+                    except VramNotElastic as e:
+                        self._json(400, {"error": {"type": "invalid_request_error", "code": "vram_not_elastic",
+                                                   "message": str(e)}})
+                    except VramResizeFailed as e:                # after the cut: the reserve is as it was
+                        self._json(409, {"error": {"type": "vram_resize_failed", "message": str(e), "cut": e.cut,
+                                                   "reserve_unchanged": True}})
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
@@ -6885,8 +7133,13 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except RequestPreempted as e:                    # cut by a VRAM preempt before an answer began
+                self._preempted(e, path)
             except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+                error = {"type": "model_busy", "message": str(e)}
+                if isinstance(e, PreemptBusy):
+                    error["cut"] = e.cut
+                self._json(409, {"error": error})
             except QueueWaitExpired as e:
                 error = {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}
                 self._note(error=error)
@@ -6917,7 +7170,10 @@ def make_handler(svc: Service):
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
             except ClientGone:                               # #1999: the client left while the request was prepared
-                self._note(outcome="disconnected")
+                if preempt_reason(self.cancel_event):        # ... or a VRAM preempt cut its picture encode: not a goodbye
+                    self._preempted(RequestPreempted(preempted_message()), path)
+                else:
+                    self._note(outcome="disconnected")
             except OSError:
                 self._note(outcome="disconnected")
                 raise                                        # as before #332: the server's own handling
@@ -6937,6 +7193,20 @@ def make_handler(svc: Service):
                         record["finished_at"] = time.time()
                         record["state"] = "error" if record.get("error") else record.get("outcome", "completed")
                     svc.request_trace.record = None
+
+        def _preempted(self, e: "RequestPreempted", path: str):
+            """A request a VRAM preempt cut, before any answer began: the error a client retries (names the cause, says
+            when).  /v1/messages: Anthropic's 529 overloaded_error (Claude Code retries it); the other routes: a 503."""
+            anthropic = path == "/v1/messages"
+            self._note(error=e.error(anthropic))
+            if anthropic:
+                body = {"type": "error", "error": e.error(True)}
+            elif path == "/v1/responses":
+                body = responses_error_body(str(e), "server_error", code=PREEMPT_CODE)
+            else:
+                body = {"error": e.error(False)}
+            self._json(529 if anthropic else 503, body,
+                       headers={"Retry-After": PREEMPT_RETRY_AFTER_S, "x-should-retry": "true"})
 
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one sd-cli job in the GPU's turn."""
@@ -7225,6 +7495,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": f"{e}; the next request restarts it"}}
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except RequestPreempted as e:                    # cut by a VRAM preempt: an error, never a finish_reason
+                err = {"error": e.error(False)}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except QueueWaitExpired as e:
                 err = {"error": {"type": "rate_limit_error", "code": "queue_wait_timeout", "message": str(e)}}
                 self._note(error=err["error"])
@@ -7266,6 +7540,8 @@ def make_handler(svc: Service):
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
             except ClientGone:
+                if preempt_reason(cancel):                   # a VRAM preempt cut the picture encode: not a goodbye
+                    return self._preempted(RequestPreempted(preempted_message()), "/v1/responses")
                 self._note(outcome="disconnected")
                 return
             except ResponsesError as e:
@@ -7300,6 +7576,8 @@ def make_handler(svc: Service):
                 except QueueWaitExpired as e:
                     return self._json(429, responses_error_body(str(e), "server_error",
                                                                 code="queue_wait_timeout"), retry_after=1)
+                except RequestPreempted as e:                # cut by a VRAM preempt: the retryable error
+                    return self._preempted(e, "/v1/responses")
                 except EngineDied as e:
                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
                                                                 code="server_error"))
@@ -7335,6 +7613,8 @@ def make_handler(svc: Service):
                 items.close()
             except EngineDied as e:                          # mid-stream: response.failed, then the stream ends
                 self._responses_failed(asm, f"{e}; the next request restarts it", "server_error", send)
+            except RequestPreempted as e:                    # cut by a VRAM preempt
+                self._responses_failed(asm, str(e), PREEMPT_CODE, send)
             except QueueWaitExpired as e:
                 self._responses_failed(asm, str(e), "queue_wait_timeout", send)
             except StructuredOutputError as e:
@@ -7459,6 +7739,10 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except RequestPreempted as e:                    # cut by a VRAM preempt: the overloaded_error Claude Code retries
+                err = {"type": "error", "error": e.error(True)}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except QueueWaitExpired as e:
