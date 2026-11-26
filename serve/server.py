@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import collections
+import array
 import base64
 import hashlib
 import hmac
@@ -423,13 +424,28 @@ class QueueCancelled(RuntimeError):
 # the server itself.  The cancel Event is the one a client disconnect sets too, so a cut is marked on the Event.
 PREEMPT_ATTR = "_strata_preempted"        # on the cancel Event: why the server (not the client) cancelled it
 GONE_ATTR = "_strata_gone"                # on the cancel Event: the client hung up (wins over a preempt mark)
-PREEMPT_RANK = 2                          # place in the fair line of a resize that preempts: ahead of everyone
+PREEMPT_RANK = 4                          # place in the fair line of a resize that preempts: ahead of everyone
+                                          # (2 before the priority lane; still the front: it outranks even a now)
 REQUEUE_RANK = 1                          # ... of a cut request the server runs again: ahead of ordinary waiters
 PREEMPT_REQUEUE_MAX = 3                   # how often the server runs one request again before it gives the error
 PREEMPT_RETRY_AFTER_S = 1                 # the Retry-After of a cut request: the resize takes tens of milliseconds
 PREEMPT_CODE = "vram_preempted"
 PREEMPT_REASON = "its VRAM was resized by a vram preempt (POST /v1/vram with preempt)"
 PREEMPT_POLL_S = 0.02                     # how often a waiting preempt cuts again (a request handed the turn meanwhile)
+
+# The priority "now" lane (docs/PRIORITY_NOW.md), opt-in with the config's "priority_lane": true and the header
+# X-Strata-Priority: now.  A now request takes rank NOW_RANK in the fair line (above waiters, above a requeued one,
+# below an admin VRAM resize) and cuts the running request with the SAME retryable error as the preempt; only a now
+# cuts, never another now.  A cut request that had to answer with an error gets a resume credit: its client's retry
+# (identical ids, hash match) runs at REQUEUE_RANK instead of the back of the line.
+NOW_RANK = 3                              # place in the fair line of a priority "now" request
+PRIORITY_ATTR = "_strata_priority"        # on the cancel Event: this request is marked "now" (_watch_client reads it)
+CUT_CAUSE_ATTR = "_strata_cut_cause"      # on the cancel Event: what cut it ("vram_preempt" | "priority_now")
+NOW_CUT_REASON = "an urgent request (X-Strata-Priority: now) needed the engine"
+NOW_CUT_LIMIT = 2                         # a request is cut by now at most this often, then it runs protected
+NOW_STREAK_MAX = 3                        # ... and after this many now turns in a row an ordinary waiter goes first
+RESUME_CREDIT_S = 120                     # how long a cut request's retry keeps its place (its id-hash is the key)
+PRIORITY_HEADER = "X-Strata-Priority"     # the header that marks a request (values: now | normal)
 
 
 def preempt_reason(cancel) -> str | None:
@@ -439,33 +455,54 @@ def preempt_reason(cancel) -> str | None:
     return getattr(cancel, PREEMPT_ATTR, None)
 
 
-class RequestPreempted(RuntimeError):
-    """A request was cut by POST /v1/vram's preempt.  `retry_safe`: nothing of it reached the client (no event
-    yielded, no picture embeddings), so Service.run may run it again itself."""
+def cut_cause(cancel) -> str:
+    """What cut this request (the error body's "cause"): "priority_now" for a now-lane cut, else "vram_preempt"."""
+    return getattr(cancel, CUT_CAUSE_ATTR, None) or "vram_preempt"
 
-    def __init__(self, message: str, retry_safe: bool = False):
+
+def _drop_requeue_place(cancel) -> None:
+    """Give back the next place in line that _hand_over_turn took for a cut request when Service.run does not end up
+    running it again.  The place may already have been granted its turn; Place.cancel passes such a grant on."""
+    place = getattr(cancel, "_strata_requeue_place", None)
+    if place is not None:
+        setattr(cancel, "_strata_requeue_place", None)
+        place.cancel()
+
+
+class RequestPreempted(RuntimeError):
+    """A request was cut by POST /v1/vram's preempt or by the priority "now" lane.  `retry_safe`: nothing of it reached
+    the client (no event yielded, no picture embeddings), so Service.run may run it again itself."""
+
+    def __init__(self, message: str, retry_safe: bool = False, cause: str = "vram_preempt"):
         super().__init__(message)
         self.retry_safe = retry_safe
+        self.cause = cause
 
     def error(self, anthropic: bool = False) -> dict:
         """The error object a route sends: names the cause and says when to retry.  Claude Code retries an
         `overloaded_error` (Anthropic's 529); the other routes' clients retry a 5xx."""
         return {"type": "overloaded_error" if anthropic else "server_error", "code": PREEMPT_CODE,
-                "message": str(self), "retry_after_s": PREEMPT_RETRY_AFTER_S}
+                "cause": self.cause, "message": str(self), "retry_after_s": PREEMPT_RETRY_AFTER_S}
 
 
-def preempted_message() -> str:
-    return (f"This request was cut because {PREEMPT_REASON}. Nothing is wrong with it: send the same request "
+def preempted_message(cause: str = "vram_preempt") -> str:
+    reason = NOW_CUT_REASON if cause == "priority_now" else PREEMPT_REASON
+    return (f"This request was cut because {reason}. Nothing is wrong with it: send the same request "
             f"again after {PREEMPT_RETRY_AFTER_S} s (Retry-After).")
 
 
 class Holder:
-    """A request that holds the engine, as a VRAM preempt sees it: its id, whether any event of it reached the caller
-    (`sent`: then it can only be ended with an error) and whether content or a tool call did (`answered`)."""
-    __slots__ = ("id", "sent", "answered")
+    """A request that holds the engine, as a VRAM preempt or a waiting now sees it: its id, whether any event of it
+    reached the caller (`sent`: then it can only be ended with an error), whether content or a tool call did
+    (`answered`), and for the lane: `now` (no other now may cut it), `protected` (cut twice already: even a now waits
+    for it), its prompt-id hash `ihash` and how often it has been cut (`cuts`, carried into the resume credit)."""
+    __slots__ = ("id", "sent", "answered", "now", "protected", "ihash", "cuts", "tokens", "refused_now")
 
-    def __init__(self, ident: str):
+    def __init__(self, ident: str, now: bool = False):
         self.id, self.sent, self.answered = ident, False, False
+        self.now, self.protected, self.ihash, self.cuts = now, False, None, 0
+        self.tokens = 0                                   # generated so far (what a cut of it loses)
+        self.refused_now = False                          # a waiting now was already refused cutting this one
 
 
 class PreemptBusy(ModelBusy):
@@ -4000,6 +4037,22 @@ class Service:
         self.turn_holders: dict[threading.Event, str] = {}   # the cancel Events of the requests that hold the engine
         self.preempt_cuts = 0                            # requests a preempting resize cut (since the server started)
         self.preempt_requeues = 0                        # ... and the ones the server ran again by itself
+        # the priority "now" lane (docs/PRIORITY_NOW.md): all off/zero until the config's "priority_lane": true turns
+        # it on, so an unconfigured server behaves exactly as before.  resume_credit maps the id-hash of a request cut
+        # by now to (expires_at, cuts so far) so its client's retry does not start at the back of the line again;
+        # priority_events is the benchmark ring (GET /v1/priority/events, section E of the lane plan).
+        self.priority_lane = False
+        self.priority_now_grace_s = 0.0                  # an answering request gets this many seconds before a now cuts it
+        self.resume_credit: dict[str, tuple[float, int]] = {}
+        self.now_served = 0                              # priority "now" requests that finished with an answer
+        self.now_cuts = 0                                # requests cut by now
+        self.now_cuts_refused_protected = 0              # ... and the nows a protected request made wait
+        self.resume_credit_hits = 0
+        self.resume_credit_misses = 0                    # a credit found only after it had expired (pruned on use)
+        self.longest_now_wait_ms = 0
+        self.priority_events: collections.deque = collections.deque(maxlen=500)
+        self.priority_seq = 0
+        self.priority_lock = threading.Lock()            # the ring and its seq, independent of status_lock
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
@@ -4159,22 +4212,87 @@ class Service:
         with self.status_lock:
             self.turn_holders.pop(cancel, None)
 
-    def preempt_cut(self, unanswered_only: bool = False) -> list[str]:
-        """Cut the requests that hold the engine now (POST /v1/vram's preempt): each one's cancel Event gets the preempt
-        mark and is set, so its generator stops at the next token and gives the turn up.  `unanswered_only`: only those
-        that have sent no content or tool call yet (nothing, or only thinking: the cheapest to cut - the server runs
-        one that sent nothing again by itself, and Claude Code retries one that sent only thinking).  A request
-        whose client left already, or that was cut before, is not counted again.  -> the cut requests' ids."""
+    def _priority_event(self, event: str, **fields) -> None:
+        """One row in the lane's benchmark ring (docs/PRIORITY_NOW.md): seq + epoch-ms wall time, so a log on this PC
+        and Strata's own log merge without clock correction.  Cut-related events also print to the server window;
+        arrived/admitted/finished are ring-only (a busy server would drown otherwise)."""
+        row = {"seq": 0, "t_ms": int(time.time() * 1000), "event": event}
+        for key in ("request_id", "route", "priority", "busy_at_arrival", "queue_ahead"):
+            if key in fields:
+                row[key] = fields.pop(key)
+        row.update(fields)
+        with self.priority_lock:
+            self.priority_seq += 1
+            row["seq"] = self.priority_seq
+            self.priority_events.append(row)
+        if event in ("cut_issued", "cut_refused", "resume_credit_hit", "resume_credit_miss", "requeued_by_server"):
+            print(f"[strata] priority lane: {event} {row.get('victim_id') or row.get('request_id') or ''}".rstrip(),
+                  flush=True)
+
+    def priority_events_since(self, since: int = 0) -> list[dict]:
+        """The lane's event ring, oldest first: rows with seq > `since` (GET /v1/priority/events)."""
+        with self.priority_lock:
+            return [dict(r) for r in self.priority_events if r["seq"] > since]
+
+    def preempt_cut(self, unanswered_only: bool = False, by_now: bool = False, by: str | None = None) -> list[str]:
+        """Cut the requests that hold the engine now (POST /v1/vram's preempt, or a waiting priority "now"): each one's
+        cancel Event gets the preempt mark and is set, so its generator stops at the next token and gives the turn up.
+        `unanswered_only`: only those that have sent no content or tool call yet (nothing, or only thinking: the
+        cheapest to cut - the server runs one that sent nothing again by itself, and Claude Code retries one that sent
+        only thinking).  A request whose client left already, or that was cut before, is not counted again.
+        `by_now` (a waiting now cutting): a holder that is itself a now, or already protected after NOW_CUT_LIMIT
+        cuts, is NOT cut (the now waits for it instead), and the cut request's id-hash goes into `resume_credit` so
+        its client's retry does not queue at the back.  A VRAM preempt (by_now=False) still cuts everything, a now
+        included - it is the controller reclaiming the memory.  -> the cut requests' ids."""
         cut = []
+        now_t = time.time()
         with self.status_lock:            # the same lock note_client_disconnect takes: one of the two wins, whole
+            for h, (exp, cuts) in list(self.resume_credit.items()):
+                if exp >= now_t:
+                    continue
+                del self.resume_credit[h]     # a cut request whose client never retried with this exact prompt
+                self.resume_credit_misses += 1
+                self._priority_event("resume_credit_miss", ihash=h[:12], cuts_so_far=cuts,
+                                     age_ms=int((now_t - (exp - RESUME_CREDIT_S)) * 1000))
             for cancel, who in list(self.turn_holders.items()):
                 if cancel.is_set() or getattr(cancel, GONE_ATTR, False) or (unanswered_only and who.answered):
                     continue
-                setattr(cancel, PREEMPT_ATTR, PREEMPT_REASON)
+                if by_now and (who.now or who.protected):
+                    # never now-by-now; a request already cut NOW_CUT_LIMIT times runs protected: say it once
+                    if not who.refused_now:
+                        who.refused_now = True
+                        if who.protected:
+                            self.now_cuts_refused_protected += 1
+                        self._priority_event("cut_refused", victim_id=who.id, by=by or "now",
+                                             why="protected" if who.protected else "now")
+                    continue
+                setattr(cancel, PREEMPT_ATTR, NOW_CUT_REASON if by_now else PREEMPT_REASON)
+                setattr(cancel, CUT_CAUSE_ATTR, "priority_now" if by_now else "vram_preempt")
                 cancel.set()
                 cut.append(who.id)
-            self.preempt_cuts += len(cut)
+                if who.ihash:             # the client's retry of THIS prompt gets a place in line (one use each)
+                    self.resume_credit[who.ihash] = (time.time() + RESUME_CREDIT_S, who.cuts + 1)
+                if by_now:
+                    self.now_cuts += 1
+                else:
+                    self.preempt_cuts += 1
+                phase = None
+                if not getattr(self.engine, "batch", 0) and self.status.get("busy"):
+                    phase = self.status.get("phase")      # the victim holds the turn on a solo engine
+                self._priority_event("cut_issued", by=by or "vram_preempt", victim_id=who.id,
+                                     victim_generated_tokens=who.tokens, victim_sent=who.sent,
+                                     victim_answered=who.answered, victim_phase=phase)
         return cut
+
+    def _hand_over_turn(self, cancel, me, is_now: bool) -> None:
+        """Give the solo engine's turn up (the ExitStack callback).  A request that a cut just ended and Service.run
+        has said it will run again (`_strata_requeue_ok`, set by run; nothing of it sent yet) takes its next place in
+        line BEFORE releasing - so the handover cannot go to whoever queued meanwhile while the cut one is between
+        attempts (a rank-1 newcomer only outranks a waiter already in line if it is in line when the turn moves).
+        The rank matches what run would pick: a cut now stays NOW_RANK, an ordinary re-run REQUEUE_RANK."""
+        if preempt_reason(cancel) and not me.sent and getattr(cancel, "_strata_requeue_ok", False):
+            setattr(cancel, "_strata_requeue_place", self.fifo.enter(NOW_RANK if is_now else REQUEUE_RANK))
+        self.fifo.release()
 
     def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
@@ -4929,6 +5047,15 @@ class Service:
             "activity": {"requests": totals["requests"] + running,
                          "in_flight": running + int(s.get("queued") or 0),
                          "last_request_at": int(last_at) if last_at else None},
+            # the lane's counters (GET /v1/status): only there when the config turns the lane on - an ordinary server
+            # keeps its status body exactly as it was.  GET /v1/priority/events has the per-event ring.
+            **({"priority": {"enabled": True, "now_served": self.now_served, "now_cuts": self.now_cuts,
+                             "now_cuts_refused_protected": self.now_cuts_refused_protected,
+                             "vram_cuts": self.preempt_cuts, "server_requeues": self.preempt_requeues,
+                             "resume_credit_hits": self.resume_credit_hits,
+                             "resume_credit_misses": self.resume_credit_misses,
+                             "streak_skips": self.fifo.streak_skips,
+                             "longest_now_wait_ms": self.longest_now_wait_ms}} if self.priority_lane else {}),
             "last_timings": last_t,
             "vram": dict((getattr(self.engine, "info", {}) or {}).get("vram") or {},
                          elastic=bool((getattr(self.engine, "info", {}) or {}).get("vram_elastic"))),
@@ -5295,24 +5422,36 @@ class Service:
             rank, again = 0, 0
             while True:
                 try:
+                    # _hand_over_turn reads this while the turn is handed on: it takes the next place in line BEFORE
+                    # releasing, so a queued request is never granted ahead of the cut one that gave the turn up
+                    setattr(cancel, "_strata_requeue_ok", again < PREEMPT_REQUEUE_MAX)
                     yield from self._run(ids, thinking, tools, max_new, sampling, cancel, force, declared_only, rank)
                     return
                 except RequestPreempted as e:
-                    # a VRAM preempt cut this request before anything of it reached the caller: run it again here,
-                    # at the front of the line behind the resize, so the client only sees a longer wait
+                    # a vram preempt or the now lane cut this request before anything of it reached the caller: run
+                    # it again here, at the front of the line behind whoever cut it, so the client only sees a longer
+                    # wait.  A cut now request keeps its own rank (a now is never demoted by being cut).
                     if not e.retry_safe or again >= PREEMPT_REQUEUE_MAX:
+                        _drop_requeue_place(cancel)
                         raise
                     with self.status_lock:             # against a client that leaves at this very moment
                         if getattr(cancel, GONE_ATTR, False):
+                            _drop_requeue_place(cancel)
                             raise
                         cancel.clear()
                         setattr(cancel, PREEMPT_ATTR, None)
                         self.preempt_requeues += 1
                     again += 1
-                    rank = REQUEUE_RANK
-                    print(f"[strata] a VRAM preempt cut this request before it sent anything: it runs again "
+                    lane_now = (self.priority_lane and not getattr(self.engine, "batch", 0)
+                                and getattr(cancel, PRIORITY_ATTR, None) == "now")
+                    rank = NOW_RANK if lane_now else REQUEUE_RANK
+                    setattr(cancel, "_strata_requeue_attempt", again)   # _run marks the resumed admission with it
+                    self._priority_event("requeued_by_server", request_id=getattr(cancel, "_strata_request_id", None),
+                                         route=getattr(cancel, "_strata_route", None), attempt=again)
+                    print(f"[strata] a preempt cut this request before it sent anything ({e.cause}): it runs again "
                           f"({again}/{PREEMPT_REQUEUE_MAX})", flush=True)
         finally:
+            _drop_requeue_place(cancel)               # a place taken by a cut attempt that this loop will not use
             if ka is not None:
                 ka.release()
 
@@ -5400,6 +5539,7 @@ class Service:
         # so the generated reasoning must not become this request's cached input (#615).
         segments = []
         timed_out = False
+        cache_n_seen = None                               # what the engine reused of this prompt (finished row)
         trace = getattr(self.request_trace, "record", None)
         waiting = time.perf_counter()
         first_engine_token_s = None  # this request, from entering the engine queue; includes queue/prefill
@@ -5408,9 +5548,37 @@ class Service:
         par = bool(getattr(self.engine, "batch", 0))
         st = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
+        # the priority lane (docs/PRIORITY_NOW.md): solo engines only - with parallel slots a request never holds the
+        # turn and cutting works through the control lines, so there the header is simply ignored.  The resume credit
+        # is keyed by a hash of the exact prompt ids: the client's own retry (same body) finds its place in line.
+        lane_on = self.priority_lane and not par
+        is_now = lane_on and getattr(cancel, PRIORITY_ATTR, None) == "now"
+        if is_now:
+            rank = max(rank, NOW_RANK)                        # the line: above waiters, behind a resize and older nows
+        ihash = hashlib.blake2b(array.array("i", ids).tobytes()).hexdigest() if lane_on else ""
+        cuts = 0
         request_id = uuid.uuid4().hex[:12]
-        me = Holder(request_id)      # what a VRAM preempt may ask about this request: did an event reach the caller
+        me = Holder(request_id, now=is_now)   # what a preempt or a waiting now may ask about this request
+        me.ihash = ihash or None
         setattr(cancel, "_strata_request_id", request_id)
+        if ihash:
+            with self.status_lock:
+                credit = self.resume_credit.pop(ihash, None)   # one use per credit; pruned on use otherwise
+            if credit is not None and credit[0] >= time.time():
+                rank = max(rank, REQUEUE_RANK)                 # the retry runs ahead of ordinary waiters again
+                cuts = credit[1]
+                self.resume_credit_hits += 1
+                self._priority_event("resume_credit_hit", request_id=request_id,
+                                     route=getattr(cancel, "_strata_route", None), ihash=ihash[:12],
+                                     cuts_so_far=cuts, priority="now" if is_now else "normal",
+                                     age_ms=int((RESUME_CREDIT_S - (credit[0] - time.time())) * 1000))
+            elif credit is not None:
+                self.resume_credit_misses += 1
+                self._priority_event("resume_credit_miss", request_id=request_id,
+                                     route=getattr(cancel, "_strata_route", None), ihash=ihash[:12],
+                                     cuts_so_far=credit[1], priority="now" if is_now else "normal", age_ms=None)
+        me.protected = lane_on and cuts >= NOW_CUT_LIMIT       # a third now waits for this one instead of cutting it
+        me.cuts = cuts
         deadline = time.monotonic() + self.queue_timeout_s if self.queue_timeout_s is not None else None
         if deadline is not None:
             setattr(cancel, "_strata_queue_deadline", deadline)
@@ -5441,7 +5609,19 @@ class Service:
                 # #1619: a request waiting for the single turn sends a keep-alive every QUEUE_BEAT_S, so a client with
                 # a stream idle timeout does not abort a healthy queued request (and its retry read the prompt again);
                 # a client that left while queued gives its place up instead of taking the turn only to cancel there
-                place = self.fifo.enter(rank)               # one place in the line for the whole wait: arrival order
+                # the re-run of a cut request already stands in the line (its place was taken by _hand_over_turn
+                # before the turn moved); an ordinary arrival takes its place now: one place for the whole wait
+                place = getattr(cancel, "_strata_requeue_place", None)
+                if place is not None:
+                    setattr(cancel, "_strata_requeue_place", None)     # consumed: run no longer owns it to give back
+                else:
+                    place = self.fifo.enter(rank)           # arrival order
+                ahead_at_arrival, busy_arrival = place.ahead(), not place.granted
+                self._priority_event("arrived", request_id=request_id,
+                                     route=getattr(cancel, "_strata_route", None),
+                                     priority="now" if is_now else "normal", busy_at_arrival=busy_arrival,
+                                     queue_ahead=ahead_at_arrival, prompt_tokens=len(ids),
+                                     ihash=ihash[:12] if ihash else None)
                 try:
                     now = time.monotonic()
                     began, beat_at, logged = now, now + QUEUE_BEAT_S, False
@@ -5453,9 +5633,15 @@ class Service:
                         if left <= 0:
                             raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                         slice_s = min(beat_at - now, left, QUEUE_LOG_S - (now - began) if not logged else left)
+                        if is_now:                          # a now cuts as it waits: same poll shape as _vram_preempt
+                            slice_s = min(slice_s, PREEMPT_POLL_S)
                         if place.wait(max(slice_s, 0.001)):
                             break
                         now = time.monotonic()
+                        if is_now:
+                            # only answering requests within the grace wait; one that sent nothing is always cut
+                            self.preempt_cut(unanswered_only=now < began + self.priority_now_grace_s,
+                                             by_now=True, by=request_id)
                         if not logged and now - began >= QUEUE_LOG_S:
                             logged = True
                             _queue_log(f"request {request_id} has waited {now - began:.0f}s for the engine, "
@@ -5472,7 +5658,7 @@ class Service:
                 if deadline is not None and time.monotonic() >= deadline:
                     self.fifo.release()
                     raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
-                turn.callback(self.fifo.release)
+                turn.callback(self._hand_over_turn, cancel, me, is_now)
             self.hold(cancel, me)                           # from here on a VRAM preempt may cut this request
             turn.callback(self.unhold, cancel)              # (runs before the turn is handed on)
             with turn:
@@ -5488,6 +5674,16 @@ class Service:
                             queued_counted = False
                             self.terminal_requests[request_id].update(state="admitted", admitted_at=time.time())
                             self._terminal_event_locked(request_id, "admitted")
+                            waited_ms = int((time.monotonic() - began) * 1000)
+                            base = {"request_id": request_id, "route": getattr(cancel, "_strata_route", None),
+                                    "priority": "now" if is_now else "normal", "busy_at_arrival": busy_arrival}
+                            self._priority_event("admitted", waited_ms=waited_ms, queue_ahead=0,
+                                                 streak_skips_so_far=self.fifo.streak_skips, **base)
+                            if is_now and waited_ms > self.longest_now_wait_ms:
+                                self.longest_now_wait_ms = waited_ms
+                            if cuts or getattr(cancel, "_strata_requeue_attempt", 0):
+                                # a request that came back after being cut (client retry or server re-queue)
+                                self._priority_event("resumed_admitted", queue_ahead=0, **base)   # cache_n: on finished
                     # issue #27: it died in an earlier request (or was unloaded) - start it again instead of failing
                     # (parallel requests do not hold the fifo: one of them starts it, the others wait for that).
                     # #1603: a parallel request stays counted as queued until it is registered as running below -
@@ -5577,6 +5773,7 @@ class Service:
                                 tail = (tail + piece)[-2:]
                                 evs = cut(parser.feed(piece))
                                 self._note(n, evs, st, rate)
+                                me.tokens = n                 # what cutting this request would lose (E.1 row)
                                 last_print = self._progress(last_print, st=st)
                                 for ev in evs:
                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
@@ -5777,6 +5974,7 @@ class Service:
                     with self.status_lock:
                         if st.get("busy") and not timed_out:
                             last = request_stats(segments)          # only this request's own DONEs count
+                            cache_n_seen = last.get("reused")
                             started = st.get("started", time.time())
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
@@ -5855,11 +6053,12 @@ class Service:
             # The turn is handed on by now.  A request a VRAM preempt cut is never an answer that ends: it raises, and
             # Service.run runs it again (nothing of it sent yet) or the route answers the retryable error.
             if finish == "cancel" and preempt_reason(cancel):
-                raise RequestPreempted(preempted_message(), retry_safe=not me.sent and not emb)
+                raise RequestPreempted(preempted_message(cut_cause(cancel)), retry_safe=not me.sent and not emb,
+                                       cause=cut_cause(cancel))
         except QueueCancelled:
             finish = "cancel"
             if preempt_reason(cancel):      # cut while it held the turn for a picture's encode, then waited again
-                raise RequestPreempted(preempted_message(), retry_safe=False)
+                raise RequestPreempted(preempted_message(cut_cause(cancel)), retry_safe=False, cause=cut_cause(cancel))
             yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
                            "reasoning_tokens": 0, "reasoning_recoveries": 0}
             return
@@ -5882,6 +6081,16 @@ class Service:
                 event = {"stop": "finished", "length": "finished", "cancel": "cancelled",
                          "disconnect": "disconnected", "timeout": "timeout", "error": "error"}.get(finish, "error")
                 self._terminal_event_locked(request_id, event, finish)
+            # the finished row of both benchmark arms (and of a victim: its cut ends as "cancel"): cache_n is what the
+            # engine reused of this prompt - for a resumed request that answers the parked-conversation question.
+            if me.now and finish in ("stop", "length"):
+                self.now_served += 1
+            self._priority_event("finished", request_id=request_id, route=getattr(cancel, "_strata_route", None),
+                                 priority="now" if is_now else "normal", finish=finish, completion_tokens=n,
+                                 total_ms=int((time.perf_counter() - waiting) * 1000),
+                                 ttft_ms=None if first_engine_token_s is None
+                                         else int(round(first_engine_token_s * 1000)),
+                                 cache_n=cache_n_seen, cuts_so_far=cuts or None)
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
@@ -6392,6 +6601,11 @@ class BadBody(Exception):
         self.status = status
 
 
+class _PriorityRejected(Exception):
+    """X-Strata-Priority had a value that is not now/normal: the 400 was answered in _watch_client already; this only
+    unwinds the route before any work starts."""
+
+
 def make_handler(svc: Service):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
@@ -6566,7 +6780,24 @@ def make_handler(svc: Service):
             until it ends, and a streamed one only a keep-alive per prompt chunk (and the first write after a hang-up
             usually still succeeds), so a dropped request kept the engine busy until its answer or the whole prompt
             was done.  Every 0.5 s: the socket readable with nothing to read (EOF) means the client closed it.  A
-            request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up."""
+            request is HTTP/1.0 and fully read here, so no later bytes are expected - data is not a hang-up.
+
+            This is also the one place every generation route passes, so the priority "now" lane reads its header
+            here (docs/PRIORITY_NOW.md): with the config's "priority_lane" on, "now" rides on the Event as an
+            attribute (like _strata_request_id: no run() signature changes); a value that is neither now nor normal
+            gets a 400 before any work.  With the lane off this does nothing at all."""
+            if svc.priority_lane:
+                raw = self.headers.get(PRIORITY_HEADER)
+                if raw is not None:
+                    value = str(raw).strip().lower()
+                    if value == "now":
+                        setattr(cancel, PRIORITY_ATTR, "now")
+                    elif value != "normal":
+                        self._json(400, {"error": {"type": "invalid_request_error",
+                                                  "message": f"{PRIORITY_HEADER} must be \"now\" or \"normal\", "
+                                                             f"not {raw!r}"}})
+                        raise _PriorityRejected()
+            setattr(cancel, "_strata_route", self.path.split("?")[0])   # the event log names the route (E.1)
             done = self.watch_done = threading.Event()
             self.cancel_event = cancel
             with svc.status_lock:
@@ -7005,6 +7236,19 @@ def make_handler(svc: Service):
             elif path == "/v1/status":
                 if self._authorized():
                     self._json(200, svc.v1_status())
+            elif path == "/v1/priority/events":
+                # the lane's benchmark ring (docs/PRIORITY_NOW.md): rows with seq > since, oldest first.  Auth as
+                # /v1/status; the ring holds the last 500 events no matter how many are asked for.
+                if self._authorized():
+                    qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    since = 0
+                    for part in qs.split("&"):
+                        if part.startswith("since="):
+                            try:
+                                since = int(part[6:])
+                            except ValueError:
+                                since = 0
+                    self._json(200, {"events": svc.priority_events_since(since)})
             else:
                 self._json(404, {"error": {"message": "not found"}})
 
@@ -7013,6 +7257,8 @@ def make_handler(svc: Service):
                 self._post()
             except BadBody as e:                              # #893: a malformed or oversized chunked body
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
+            except _PriorityRejected:                         # an invalid X-Strata-Priority: the 400 is answered there
+                pass
 
         def _post(self):
             if not self._authorized():
@@ -7201,8 +7447,9 @@ def make_handler(svc: Service):
                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
 
             except ClientGone:                               # #1999: the client left while the request was prepared
-                if preempt_reason(self.cancel_event):        # ... or a VRAM preempt cut its picture encode: not a goodbye
-                    self._preempted(RequestPreempted(preempted_message()), path)
+                if preempt_reason(self.cancel_event):        # ... or a preempt cut its picture encode: not a goodbye
+                    self._preempted(RequestPreempted(preempted_message(cut_cause(self.cancel_event)),
+                                                  cause=cut_cause(self.cancel_event)), path)
                 else:
                     self._note(outcome="disconnected")
             except OSError:
@@ -7571,8 +7818,9 @@ def make_handler(svc: Service):
             try:
                 ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
             except ClientGone:
-                if preempt_reason(cancel):                   # a VRAM preempt cut the picture encode: not a goodbye
-                    return self._preempted(RequestPreempted(preempted_message()), "/v1/responses")
+                if preempt_reason(cancel):                   # a preempt cut the picture encode: not a goodbye
+                    return self._preempted(RequestPreempted(preempted_message(cut_cause(cancel)),
+                                                            cause=cut_cause(cancel)), "/v1/responses")
                 self._note(outcome="disconnected")
                 return
             except ResponsesError as e:
@@ -8902,6 +9150,24 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    # The priority "now" lane (docs/PRIORITY_NOW.md): opt-in with the config's "priority_lane": true, honoured per
+    # request by the header X-Strata-Priority: now.  A now waits at rank 3 and cuts the running request with the same
+    # retryable error a VRAM preempt uses; the fifo gets the streak cap so a chain of now requests cannot hold off the
+    # ordinary line.  The swap happens before serve() starts, so no place was ever taken on the old lock.  With
+    # parallel slots the lane stays off (there a request never holds the turn and cutting runs through the control lines).
+    svc.priority_lane = cfg.get("priority_lane") is True
+    try:
+        svc.priority_now_grace_s = float(cfg.get("priority_now_grace_s") or 0)
+    except (TypeError, ValueError):
+        print("[strata] \"priority_now_grace_s\" in the config is not a number; using 0", flush=True)
+    if svc.priority_lane and getattr(svc.engine, "batch", 0):
+        print("[strata] priority lane requested but ignored: this engine runs with parallel slots (the lane needs "
+              "one solo slot)", flush=True)
+        svc.priority_lane = False
+    if svc.priority_lane:
+        svc.fifo = FairLock(max_streak=NOW_STREAK_MAX, capped_rank=NOW_RANK)
+        print(f"[strata] priority lane: on ({PRIORITY_HEADER}: now cuts the running request; max {NOW_CUT_LIMIT} "
+              f"cuts per request, {NOW_STREAK_MAX} urgent turns in a row)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
