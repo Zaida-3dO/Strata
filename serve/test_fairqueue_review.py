@@ -150,9 +150,10 @@ class AFailingLogLineNeverWedgesTheQueue(unittest.TestCase):
 
 
 class VramResizeOrder(unittest.TestCase):
-    def test_a_resize_waits_behind_queued_requests(self):
-        """Pins what POST /v1/vram does today: its acquire (with a timeout) takes a place at the back of the line, behind
-        the requests already waiting.  (A later change adds an opt-in front-of-line entry for it.)"""
+    def test_a_resize_without_preempt_waits_its_turn_behind_queued_requests(self):
+        """Pins what POST /v1/vram does without "preempt": its acquire (with a timeout) takes a place at the back of the
+        line, behind the requests already waiting.  With "preempt": true it enters at PREEMPT_RANK and goes to the front
+        instead (serve/test_vram_preempt.py)."""
         lock = FairLock()
         lock.acquire()
         order = []

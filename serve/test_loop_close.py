@@ -103,6 +103,9 @@ class LoopClose(unittest.TestCase):
 
     def test_a_second_loop_in_the_thinking_after_the_wrap_up_stops_cleanly(self):
         # the wrap-up closed the thinking, but the model opens another thinking block and loops in it again
+        # (Review note: the parser never re-enters the reasoning state after </think>, so the second run is stopped as a
+        # run in the answer and this passes without the `not loop_closed` guard in _run.  The guard is kept, harmless and
+        # probably unreachable; this test pins the outcome, not the guard.)
         engine, done, reasoning, content, log = self.run_reply(
             ["Let me think. " + "0" * 600, "hm<think>\n" + "1" * 600])
         self.assertEqual(len(engine.prompts), 2)                    # never a third pass
