@@ -268,7 +268,11 @@ def focused_recovery_prompt(tok, ids, generated):
 
 
 def _queue_log(message: str) -> None:
-    print(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} queue: {message}", file=sys.stderr, flush=True)
+    """A queue line in the server log.  A log that cannot be written (stderr closed or gone) must never touch the queue."""
+    try:
+        print(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} queue: {message}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
 
 
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
@@ -4361,16 +4365,19 @@ class Service:
             except (ValueError, EngineDied) as e:
                 print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
-    vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
+    vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for its turn in the line
 
     def vram(self, reserve_mib: int | None) -> dict:
         """#533, POST /v1/vram: keep `reserve_mib` of VRAM free for other programs (None: the reserve the engine
-        started with), applied between requests - a request that is running finishes first (up to wait_s).  Only an
-        engine started with --vram-elastic (the config's "vram_elastic": true) can do it; it never resizes on its own.
-        An unloaded engine applies it when it loads.  -> {"status": ..., and the engine's figures}."""
+        started with), applied between requests.  The resize waits its turn in the fifo's line (up to wait_s): the
+        request that is running finishes first, and so does every request that was already waiting - it does not
+        jump the line.  With several long requests queued, the wait can run out (ModelBusy).  (A later change adds an
+        opt-in front-of-line entry for it.)  Only an engine started with --vram-elastic (the config's "vram_elastic":
+        true) can do it; it never resizes on its own.  An unloaded engine applies it when it loads.
+        -> {"status": ..., and the engine's figures}."""
         if not hasattr(self.engine, "vram"):
             raise ValueError("this engine cannot resize its VRAM use")
-        if not self.fifo.acquire(timeout=self.vram_wait_s):
+        if not self.fifo.acquire(timeout=self.vram_wait_s):         # a place at the back of the line, like any request
             raise ModelBusy("a request is still running; try again when it has finished")
         # parallel requests do not hold the fifo: the engine's control lines (a prompt being admitted) are taken too,
         # and the engine refuses a resize while a slot decodes
@@ -5246,9 +5253,9 @@ class Service:
                     self.fifo.release()
                     raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
                 turn.callback(self.fifo.release)
-                if logged:
-                    _queue_log(f"request {request_id} admitted after {time.monotonic() - began:.0f}s")
             with turn:
+                if not par and logged:                      # inside the with: whatever this line does, the turn is released
+                    _queue_log(f"request {request_id} admitted after {time.monotonic() - began:.0f}s")
                 try:
                     with self.status_lock:
                         if trace is not None:

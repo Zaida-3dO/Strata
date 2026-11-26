@@ -18,6 +18,11 @@ times out does not cost it its position:
         place.cancel()              # leave the line; a turn handed over meanwhile moves on to the next waiter
         raise
     ...                             # it holds the turn: lock.release() when done
+
+Known limit: the order is per turn, not per request.  One request can take the turn more than once (load() when the
+model was unloaded, each image encode, then the generation), and each time it takes a new place at the back of the
+line, so a request that needs a second turn waits again behind whoever arrived in between.  That is no worse than the
+old random order.  Carrying a request's first place across its turns would fix it.
 """
 from __future__ import annotations
 

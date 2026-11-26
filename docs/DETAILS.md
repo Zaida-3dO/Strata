@@ -733,8 +733,9 @@ the OS file cache, so loading again takes seconds while that RAM is not needed e
 in the config (the engine flag `--vram-elastic`), the expert cache is allocated in 512 MiB segments
 (`"vram_segment_mib"`), and `POST /v1/vram` with `{"reserve_mib": 8000}` shrinks it between requests until that much
 VRAM is free for another program; `{"reserve_mib": null}` grows it back towards its full size, keeping the reserve
-the engine started with (`--vram-reserve-mib`), and `{"reserve_mib": 0}` takes all of it back. A request that is
-running finishes first. The experts of the segments given back are computed on the CPU, like any expert outside the
+the engine started with (`--vram-reserve-mib`), and `{"reserve_mib": 0}` takes all of it back. The resize waits
+its turn in the line: the request that is running and the requests already waiting finish first (it answers 409 `model_busy`
+after 300 s). The experts of the segments given back are computed on the CPU, like any expert outside the
 cache, so answers keep coming, slower; growing back puts the same experts in the same slots. Nothing resizes on its
 own. Not with a layer split, the helper caches, `--peer-device` or the resident low-RAM mode. Measured on an RTX 5070
 12 GB with Q2_0 (4.8 GiB cache): `{"reserve_mib": 6000}` took 78 ms and freed 4.3 GiB (the cache keeps 0.5 GiB for
