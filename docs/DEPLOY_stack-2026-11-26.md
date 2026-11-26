@@ -293,6 +293,17 @@ model with the harness that Helm uses (`tools-local\cc-env.sh` sets `ANTHROPIC_B
 6. After every preempt: `GET /v1/status` is idle, the next normal request answers, and the log has
    `VRAM preempt (cut): cut N request(s), the turn came after X ms, the resize took Y ms`.
 
+**8d.2 Priority "now" lane** (item 31eba9c3; only if the server has it: `"priority_lane": true` in `strata-<model>.json`,
+off by default - without that key skip this). The start log must carry `priority lane: on (X-Strata-Priority: now ...)`. Then:
+```powershell
+python "$NEW\tools\stack_live_check.py" now --live --yes-cut-requests
+```
+It starts a long generation, sends one short request with `X-Strata-Priority: now` mid-stream, and prints the
+`GET /v1/priority/events` timeline. **PASS:** the now answered while the long request was still going (cut once,
+`now_cuts` up), the long request retried through `tools\strata_retry.py`, took its resume credit (`resume_credit_hits`)
+and finished with a full answer; afterwards `/v1/status` `"priority"` shows it and the server is idle. Run this only
+after 8d has grown the cache back.
+
 **8e.** Rollback criteria are in section 10.
 
 **Known limits to watch** (from the review; none is a rollback reason):

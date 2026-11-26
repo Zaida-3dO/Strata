@@ -8,11 +8,13 @@
     python tools/stack_live_check.py penalty [--runs 3]      a coding task and a tool call, presence_penalty default vs 0
     python tools/stack_live_check.py preempt [--reserve 5800] [--grace 0]
                                                              cut a long generation with POST /v1/vram preempt, retry it
+    python tools/stack_live_check.py now                     a long generation, one X-Strata-Priority: now request in the
+                                                             middle: the now answers first, the long one retries and finishes
 
 Nothing is sent unless you say where: --base URL (a test or a spare server), or --live (the Solo server on
 http://127.0.0.1:18731, the one people are using; --base then replaces the address).  The key comes from --key or the
 STRATA_KEY variable; only with --live is the "key" in launch/solo.choices.json read as well (never printed).  The preempt
-check cuts the requests that are running, so it also needs --yes-cut-requests.  Run bare, the script prints this and exits
+and now checks cut the requests that are running, so they also need --yes-cut-requests.  Run bare, the script prints this and exits
 with 2 without sending anything.  Every check prints PASS or FAIL for what it can see from outside; the server log
 (runtime/launch-solo.server.log) says the rest.  Nothing here changes a setting: preempt resizes the expert cache and
 grows it back at the end.
@@ -46,9 +48,10 @@ class Api:
         self.base = base.rstrip("/")
         self._model = None
 
-    def call(self, method, path, body=None, timeout=600):
+    def call(self, method, path, body=None, timeout=600, headers=None):
+        """headers: extra request headers for this one call (the now check adds X-Strata-Priority)."""
         c = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-        c.request(method, path, json.dumps(body) if body is not None else None, self.headers)
+        c.request(method, path, json.dumps(body) if body is not None else None, {**self.headers, **(headers or {})})
         return c, c.getresponse()
 
     def json(self, method, path, body=None, timeout=600):
@@ -64,9 +67,9 @@ class Api:
             self._model = self.json("GET", "/v1/models")[1]["data"][0]["id"]
         return self._model
 
-    def stream(self, path, body, on_event=None):
+    def stream(self, path, body, on_event=None, headers=None):
         """POST a streamed request; -> (status, [(event name or None, data)]).  on_event is called as each one arrives."""
-        c, r = self.call("POST", path, body)
+        c, r = self.call("POST", path, body, headers=headers)
         events, name = [], None
         try:
             if r.status != 200:
@@ -276,9 +279,65 @@ def check_preempt(api, a):
                       "the cut request was sent again and got its answer (or ended within the grace)"))
 
 
+def check_now(api, a):
+    from strata_retry import post_with_retry
+    st, status = api.json("GET", "/v1/status")
+    lane = (status or {}).get("priority") if isinstance(status, dict) else None
+    print(f"  /v1/status priority: {lane}")
+    if not lane or not lane.get("enabled"):
+        return verdict(False, "the priority lane is off on this server (config \"priority_lane\": true turns it on)")
+    before_events = api.json("GET", "/v1/priority/events?since=0")[1].get("events", [])
+    since = before_events[-1]["seq"] if before_events else 0
+    body = chat(api, "Write a very long story about a lighthouse keeper. Keep going for many pages.", 4000)
+    got, retried, result = [], [], {}
+    headers = dict(api.headers)
+
+    def go():
+        result["reply"] = post_with_retry(api.base + "/v1/chat/completions", body, headers=headers, stream=True,
+                                          on_retry=lambda n, why: retried.append((time.monotonic(), why)),
+                                          on_event=lambda n, d: got.append(time.monotonic()), timeout=900)
+    t = threading.Thread(target=go)
+    t.start()
+    end = time.monotonic() + 180
+    while len(got) < 20 and time.monotonic() < end:
+        time.sleep(0.05)
+    if len(got) < 20:
+        return verdict(False, "the long request never streamed")
+    now_seen = []
+    t_now = time.monotonic()
+    st_now, ev_now = api.stream("/v1/chat/completions", chat(api, "Reply with exactly: NOW-ANSWER", 64),
+                                lambda n, d: now_seen.append(time.monotonic()),
+                                headers={"X-Strata-Priority": "now"})
+    now_first = now_seen[0] if now_seen else None
+    now_text = text_of(ev_now)
+    t.join(900)
+    reply = result.get("reply")
+    long_last = got[-1] if got else None
+    print(f"  the now request: status {st_now}, first text {'%.2f s' % (now_first - t_now) if now_first else 'never'}, "
+          f"text {now_text[:30]!r}")
+    print(f"  the long request: cut {len(retried)} time(s), final status {getattr(reply, 'status', None)}, attempts "
+          f"{getattr(reply, 'attempts', None)}, still streaming at {long_last - t_now:.2f} s after the now arrived")
+    ev = api.json("GET", f"/v1/priority/events?since={since}")[1].get("events", [])
+    for row in ev:
+        print(f"  [{row['seq']}] +{(row['t_ms'] - before_events[-1]['t_ms']) / 1000 if before_events else 0:.2f} "
+              f"{row['event']} {row.get('request_id') or row.get('victim_id') or ''} {row.get('why') or row.get('by') or ''}")
+    after = api.json("GET", "/v1/status")[1].get("priority", {})
+    cuts_now = [e for e in ev if e["event"] == "cut_issued" and e.get("by") != "vram_preempt"]
+    now_rows = [e for e in ev if e.get("priority") == "now" and e["event"] == "finished"]
+    return (verdict(bool(cuts_now) and after.get("now_cuts", 0) >= 1, "the running request was cut by the now "
+                                                                     "(cut_issued, now_cuts up)")
+            + verdict(st_now == 200 and "NOW-ANSWER" in now_text and bool(now_first),
+                      "the now request answered fully")
+            + verdict(bool(now_first) and long_last is not None and now_first < long_last - 0.5,
+                      "the now was answered while the long request was still going")
+            + verdict(bool(reply) and reply.ok and retried and text_of(reply.events or []) and any(
+                e["event"] == "resume_credit_hit" for e in ev),
+                      "the cut request sent itself again, got its resume credit, and finished with an answer"))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("check", choices=["fair", "messages", "loop", "penalty", "preempt"])
+    p.add_argument("check", choices=["fair", "messages", "loop", "penalty", "preempt", "now"])
     p.add_argument("--base", help="the server to test (nothing is sent without this or --live)")
     p.add_argument("--live", action="store_true", help=f"the live Solo server at {LIVE_BASE}; also reads its key from launch/solo.choices.json")
     p.add_argument("--yes-cut-requests", action="store_true", dest="yes_cut",
@@ -296,8 +355,8 @@ def main():
         print("Nothing was sent. Say where: --base URL for a test server, or --live for the live Solo server "
               f"({LIVE_BASE}), which people may be using.", file=sys.stderr)
         sys.exit(2)
-    if a.check == "preempt" and not a.yes_cut:
-        print("Nothing was sent. The preempt check cuts the requests running on the server; add --yes-cut-requests "
+    if a.check in ("preempt", "now") and not a.yes_cut:
+        print(f"Nothing was sent. The {a.check} check cuts the requests running on the server; add --yes-cut-requests "
               "when that is fine.", file=sys.stderr)
         sys.exit(2)
     api = Api(a.base or LIVE_BASE, a.key, read_live_key=a.live)

@@ -101,7 +101,10 @@ reply = post_with_retry("http://127.0.0.1:8080/v1/messages", body, headers={"x-a
 reply.ok, reply.status, reply.attempts, reply.events
 ```
 
-or `python tools/strata_retry.py URL --body-file request.json --stream`.
+or `python tools/strata_retry.py URL --body-file request.json --stream`. The same error and the same three rules apply
+when a priority "now" request cuts the running one ([PRIORITY_NOW.md](PRIORITY_NOW.md)); the only addition is an
+optional `"cause"` field in the error object (`"vram_preempt"` or `"priority_now"`), which a client that follows these
+rules never has to read - `strata_retry` retries both the same way **(test)**.
 
 ### What happens to Claude Code
 

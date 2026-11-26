@@ -743,6 +743,15 @@ own. Not with a layer split, the helper caches, `--peer-device` or the resident 
 the prompt path), decode 44 -> 33 tok/s; growing back took 92 ms and the answers were token for token the ones before
 the shrink. Without the flag nothing changes (the same answers as without it).
 
+**The priority "now" lane (opt-in; [PRIORITY_NOW.md](PRIORITY_NOW.md)).** With `"priority_lane": true` in the config,
+a request sent with the header `X-Strata-Priority: now` stands at the front of the line (behind a VRAM resize) and, if
+one is running, cuts it with the same retryable error a preempt uses - twice per request at most, then that request
+runs protected. Its client's own retry keeps its place through a resume credit (120 s, one use). A third `now` in a row
+never holds off an ordinary waiter (`FairLock(max_streak=3)`), and a resize outranks the lane. `"priority_now_grace_s"`
+(default 0) lets an answering request finish that many seconds before a now cuts it. With the key off - the default -
+the header does nothing and every route is as before. Pinned by `serve/test_priority_now.py` on a fake engine; the
+parked-conversation behaviour of a cut-and-retried prompt behind an interleaved now is not measured yet.
+
 **Keep what the expert cache learned across restarts (opt-in, engine 0.1.36, #477):** a start fills the GPU's expert
 cache from the shipped profile, and the adaptive tier (`--adapt-every`) then moves in the experts your requests use.
 With `"expert_profile_save": "expert-profile-learned.bin"` in `strata-<model>.json` the engine saves that as a
@@ -1082,7 +1091,8 @@ print(r.choices[0].message.content)
 - **Model settings in the web page (0.1.39, #564).** The About tab's Model settings card shows and changes a few of
   the keys above in `strata-<model>.json`: the `sampling` defaults (temperature, top_p, top_k, min_p),
   `reasoning_budget_tokens`, `fit_max_tokens`, `anthropic_thinking`, `effort_position`, `aliases`, `idle_unload_s`,
-  `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser` and `--vram-reserve-mib`. An empty field removes the
+  `lazy_load`, `engine_silence_s`, `api_monitor`, `open_browser`, `priority_lane`, `priority_now_grace_s` and
+  `--vram-reserve-mib`. An empty field removes the
   key (its default). Every other key of the file stays as it is, the earlier file is kept as
   `strata-<model>.json.bak`, and the model uses the change from its next start. Only Strata's own page can save
   (JSON, the API key when one is set, as for the Chat settings); the network, key, MCP and program keys are not

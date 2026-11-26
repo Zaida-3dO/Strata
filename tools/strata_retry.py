@@ -59,9 +59,12 @@ class Gave_up(Exception):
 def error_of(reply):
     """The error object a reply carries, or None: from the JSON body of an error status, or from an `error` event or
     chunk of a stream that began with 200.  (Both Anthropic's {"type": "error", "error": {...}} and OpenAI's
-    {"error": {...}} keep it under "error".)"""
+    {"error": {...}} keep it under "error"; the /v1/responses dialect keeps it inside the failed response:
+    {"type": "response.failed", "response": {"error": {...}}}.)"""
     for data in [e[1] for e in reply.events if isinstance(e[1], dict)] or [_body_json(reply.body)]:
         err = data.get("error") if isinstance(data, dict) else None
+        if not isinstance(err, dict) and isinstance(data, dict) and data.get("type") == "response.failed":
+            err = (data.get("response") or {}).get("error")
         if isinstance(err, dict):
             return err
     return None
