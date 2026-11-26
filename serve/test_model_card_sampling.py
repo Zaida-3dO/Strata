@@ -59,7 +59,8 @@ class ModelCardSampling(unittest.TestCase):
         return StrataEngine.sampling_keys(self.engine.sampling)
 
     def test_tables(self):
-        self.assertEqual(model_card_sampling("qwen4exp", True), {"temperature": 1.0, "top_p": 0.95, "top_k": 20})
+        self.assertEqual(model_card_sampling("qwen4exp", True),
+                         {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5})
         self.assertEqual(model_card_sampling("qwen4exp", False),
                          {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5})
         self.assertEqual(model_card_sampling("qwen35moe", True)["presence_penalty"], 1.5)
@@ -71,7 +72,17 @@ class ModelCardSampling(unittest.TestCase):
         self.assertIn("temperature=1.0", k)
         self.assertIn("top_p=0.95", k)
         self.assertIn("top_k=20", k)
-        self.assertNotIn("penalty_present", k)
+        self.assertIn("penalty_present=1.5", k)      # the loop-fix default (24 Nov 2026): thinking gets it too
+
+    def test_thinking_presence_penalty_can_be_overridden(self):
+        self.assertIn("penalty_present=0.5", self.keys(presence_penalty=0.5))       # the request wins
+        self.assertNotIn("penalty_present", self.keys(presence_penalty=0))          # an explicit 0 stays 0
+        self.svc.sampling_defaults = {"presence_penalty": 0.8}                      # the run config's sampling block
+        self.assertIn("penalty_present=0.8", self.keys())
+        self.assertIn("penalty_present=0.3", self.keys(presence_penalty=0.3))
+        self.svc.sampling_defaults = {}
+        self.svc.shared = {"presence_penalty": 1.1}                                 # the Chat settings shared with apps
+        self.assertIn("penalty_present=1.1", self.keys())
 
     def test_non_thinking_default(self):
         k = self.keys(reasoning_effort="none")
