@@ -293,7 +293,8 @@ class CutRunning(PreemptCase):
         self.assertEqual(self.svc.preempt_cuts, 0)
 
     def test_the_reserve_is_remembered_like_a_plain_resize(self):
-        self.vram({"reserve_mib": 3000, "preempt": True})
+        _, _, body = self.vram({"reserve_mib": 3000, "preempt": True})
+        self.assertIn("preempt", body)
         self.assertEqual((self.svc.vram_reserve, self.svc.vram_reserve_asked), (3000, True))
 
     def test_an_unloaded_engine_only_records_the_reserve(self):
@@ -540,20 +541,20 @@ class Grace(PreemptCase):
 
 
 class TwoPreempts(PreemptCase):
-    def test_two_preempts_behind_a_turn_nobody_can_cut_run_in_arrival_order(self):
+    def test_two_preempts_behind_a_turn_nobody_can_cut_run_in_arrival_order_ahead_of_a_waiting_request(self):
         self.svc.fifo.acquire()                  # a session save holds the turn
         results = []
+        a = self.start("/v1/chat/completions", openai("A-request", stream=False))   # waits first ...
+        self.wait_until(lambda: self.svc.status["queued"] == 1, "a request never queued")
 
         def go(reserve):
             results.append((reserve, self.vram({"reserve_mib": reserve, "preempt": True})))
         t1 = threading.Thread(target=go, args=(1000,))
         t1.start()
-        self.wait_until(lambda: self.svc.fifo.waiting() == 1, "the first preempt never queued")
+        self.wait_until(lambda: self.svc.fifo.waiting() == 2, "the first preempt never queued")
         t2 = threading.Thread(target=go, args=(2000,))
         t2.start()
-        self.wait_until(lambda: self.svc.fifo.waiting() == 2, "the second preempt never queued")
-        a = self.start("/v1/chat/completions", openai("A-request", stream=False))
-        self.wait_until(lambda: self.svc.status["queued"] == 1, "a request never queued")
+        self.wait_until(lambda: self.svc.fifo.waiting() == 3, "the second preempt never queued")    # ... they jump it
         self.plans = [{"text": SHORT, "delay": 0.0}]
         self.engine.plans = self.plans
         self.svc.fifo.release()
@@ -564,6 +565,7 @@ class TwoPreempts(PreemptCase):
         self.assertEqual(sorted(code for _, (code, _, _) in results), [200, 200])
         self.assertEqual(a.status, 200)                                  # it ran after both: not cut, not skipped
         self.assertEqual([e[0] for e in self.engine.log if e[0] in ("start", "resize")], ["resize", "resize", "start"])
+        self.assertEqual(a.json()["choices"][0]["finish_reason"], "stop")
 
     def test_two_preempts_against_a_running_request_cut_it_once(self):
         a = self.start("/v1/messages", anthropic())
