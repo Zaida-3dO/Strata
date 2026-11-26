@@ -58,6 +58,9 @@ Content-Type: application/json          (anything else: 415)
   server window (`(the driver has no VRAM for another expert-cache segment)`).
 - The figures are measured after the call (`cudaMemGetInfo`), so another program that allocates a moment later is not in them.
 
+To resize at once instead of waiting for the running request, see [VRAM_PREEMPT.md](VRAM_PREEMPT.md) (`"preempt": true`:
+the running request is cut and ends with an error a client retries).
+
 ## When the engine says no (400, engine stays up)
 
 - `VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)`.
