@@ -9,8 +9,8 @@ ends with an error that says it is safe to send it again (docs/VRAM_PREEMPT.md):
     both with Retry-After and x-should-retry: true; or, once a stream has started, the same body as an SSE event
     ("event: error" on /v1/messages, "data: {"error": ...}" on /v1/chat/completions).
 
-This helper sends the same request again after the wait the server asked for.  It retries nothing else: a 400, a 401, a
-409 model_busy or a 5xx without that error is returned to the caller as it is.
+This helper sends the same request again after the wait the server asked for.  It retries only that error (and
+Anthropic's own `overloaded_error`): a 400, a 401, a 409 model_busy or a 5xx without it is returned to the caller as it is.
 
     from strata_retry import post_with_retry
     reply = post_with_retry("http://127.0.0.1:8080/v1/messages", body, headers={"x-api-key": key}, stream=True)
