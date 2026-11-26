@@ -495,12 +495,14 @@ class Holder:
     """A request that holds the engine, as a VRAM preempt or a waiting now sees it: its id, whether any event of it
     reached the caller (`sent`: then it can only be ended with an error), whether content or a tool call did
     (`answered`), and for the lane: `now` (no other now may cut it), `protected` (cut twice already: even a now waits
-    for it), its prompt-id hash `ihash` and how often it has been cut (`cuts`, carried into the resume credit)."""
-    __slots__ = ("id", "sent", "answered", "now", "protected", "ihash", "cuts", "tokens", "refused_now")
+    for it), `tool_done` (a tool call completed this turn - its client would run that tool again on a retry, D1 of
+    review-B), its prompt-id hash `ihash` and how often it has been cut (`cuts`, carried into the resume credit)."""
+    __slots__ = ("id", "sent", "answered", "now", "protected", "tool_done", "ihash", "cuts", "tokens", "refused_now")
 
     def __init__(self, ident: str, now: bool = False):
         self.id, self.sent, self.answered = ident, False, False
         self.now, self.protected, self.ihash, self.cuts = now, False, None, 0
+        self.tool_done = False                            # a whole tool-call event was emitted (D1)
         self.tokens = 0                                   # generated so far (what a cut of it loses)
         self.refused_now = False                          # a waiting now was already refused cutting this one
 
@@ -4045,6 +4047,7 @@ class Service:
         self.priority_now_grace_s = 0.0                  # an answering request gets this many seconds before a now cuts it
         self.resume_credit: dict[str, tuple[float, int]] = {}
         self.now_served = 0                              # priority "now" requests that finished with an answer
+        self.now_cuts_refused_tool_done = 0              # nows refused: a turn whose tool call completed (D1, review-B)
         self.now_cuts = 0                                # requests cut by now
         self.now_cuts_refused_protected = 0              # ... and the nows a protected request made wait
         self.resume_credit_hits = 0
@@ -4257,14 +4260,18 @@ class Service:
             for cancel, who in list(self.turn_holders.items()):
                 if cancel.is_set() or getattr(cancel, GONE_ATTR, False) or (unanswered_only and who.answered):
                     continue
-                if by_now and (who.now or who.protected):
-                    # never now-by-now; a request already cut NOW_CUT_LIMIT times runs protected: say it once
+                if by_now and (who.now or who.protected or who.tool_done):
+                    # never now-by-now; a request already cut NOW_CUT_LIMIT times runs protected; and a turn whose tool
+                    # call completed whole is not cut at all (D1, review-B): its client resends the whole request and
+                    # would run that tool a second time - Bash commits, file writes, HA service calls.  Say it once.
                     if not who.refused_now:
                         who.refused_now = True
-                        if who.protected:
+                        why = "protected" if who.protected else ("tool_done" if who.tool_done else "now")
+                        if why == "protected":
                             self.now_cuts_refused_protected += 1
-                        self._priority_event("cut_refused", victim_id=who.id, by=by or "now",
-                                             why="protected" if who.protected else "now")
+                        elif why == "tool_done":
+                            self.now_cuts_refused_tool_done += 1
+                        self._priority_event("cut_refused", victim_id=who.id, by=by or "now", why=why)
                     continue
                 setattr(cancel, PREEMPT_ATTR, NOW_CUT_REASON if by_now else PREEMPT_REASON)
                 setattr(cancel, CUT_CAUSE_ATTR, "priority_now" if by_now else "vram_preempt")
@@ -5051,6 +5058,7 @@ class Service:
             # keeps its status body exactly as it was.  GET /v1/priority/events has the per-event ring.
             **({"priority": {"enabled": True, "now_served": self.now_served, "now_cuts": self.now_cuts,
                              "now_cuts_refused_protected": self.now_cuts_refused_protected,
+                             "now_cuts_refused_tool_done": self.now_cuts_refused_tool_done,
                              "vram_cuts": self.preempt_cuts, "server_requeues": self.preempt_requeues,
                              "resume_credit_hits": self.resume_credit_hits,
                              "resume_credit_misses": self.resume_credit_misses,
@@ -5111,7 +5119,11 @@ class Service:
             self.fifo.acquire()
             cuttable = False
         else:
-            place = self.fifo.enter()
+            # M3 (review-B): a request marked X-Strata-Priority: now takes its encode at rank 3 too, and the encode
+            # is held as a now - so a second now must not cut it either ("never now-by-now" covers picture encodes)
+            is_now = (self.priority_lane and not getattr(self.engine, "batch", 0)
+                      and getattr(cancel, PRIORITY_ATTR, None) == "now")
+            place = self.fifo.enter(NOW_RANK if is_now else 0)
             try:
                 while not place.wait(0.25):
                     if cancel.is_set():
@@ -5120,7 +5132,8 @@ class Service:
                 place.cancel()
                 raise
         if cuttable:
-            self.hold(cancel, Holder("image-encode"))
+            self.hold(cancel, Holder("image-encode", now=getattr(cancel, PRIORITY_ATTR, None) == "now"
+                                     and self.priority_lane))
         try:
             yield
         finally:
@@ -5780,6 +5793,10 @@ class Service:
                                         reasoning_text += ev.text or ""
                                     if ev.kind in ("content", "tool_start", "tool_call"):
                                         answered = me.answered = True
+                                    if ev.kind == "tool_call":
+                                        # D1 (review-B): the call is whole, an agent that streams may have started it:
+                                        # a retry would run the tool twice, so no now cuts this request any more
+                                        me.tool_done = True
                                     me.sent = True
                                     yield "event", ev
                                 if evs:

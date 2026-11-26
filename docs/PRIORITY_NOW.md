@@ -4,7 +4,10 @@ One house, one GPU, one engine. A speaker command or a phone message should not 
 The lane lets one marked request take the engine now: it stands ahead of everyone waiting, and it cuts the request that
 is running - with exactly the retryable error a VRAM preempt already uses ([VRAM_PREEMPT.md](VRAM_PREEMPT.md)).
 
-It is opt-in and off by default: without it every route, rank and error is byte-identical to before **(test)**. Marks:
+It is opt-in and off by default. With it off the lane does nothing at all (no header read, no ranks, no cutting); with
+the config key absent a server still carries three additions that need nothing of clients: a `"cause"` field in the
+preempt error body (`"vram_preempt"`), the log and ring lines a VRAM preempt writes (`cut_issued ...`), and
+`GET /v1/priority/events` listing them **(test)**. Marks:
 **(measured)** was run on real hardware; **(code)** is read from the code; **(test)** is pinned by
 `serve/test_priority_now.py` / `serve/test_fairlock_streak.py` (CPU only, fake engine - no number here is a GPU
 measurement).
@@ -71,8 +74,13 @@ A long agent turn should not be sacrificed again and again for a chain of urgent
   (the decode done) is not paid back; for a 60 s turn that is up to ~35 s per cut (**measured** at 6000 tokens in the
   resize-elastic run of 24 Nov).
 - **Three now turns in a row.** `FairLock(max_streak=3)`: after three grants to rank 3 while an ordinary request waits,
-  the next grant goes to the oldest waiting ordinary or resumed request, then the lane runs again. A resize (rank 4) is
-  never delayed by this and never counted **(test: serve/test_fairlock_streak.py)**.
+  the next grant goes to the first waiting lower-rank place in line order (a resumed one, then an ordinary one), then
+  the lane runs again. A resize (rank 4) is never delayed by this and never counted; when the waiter that justified a
+  streak leaves the line, or the line empties, the count restarts - one lone `now` is never made to wait for nothing
+  **(test: serve/test_fairlock_streak.py)**.
+- **A completed tool call ends the cutting.** Once a whole tool-call has been streamed out, an agent may already have
+  run it; cutting would make its retry run that tool a second time (a `git commit`, a file write, an HA service call).
+  Even a `now` waits for such a turn: the refusal is logged as `cut_refused why="tool_done"` and counted **(test)**.
 
 ## The resume credit: a cut request's retry does not queue at the back
 
@@ -103,8 +111,8 @@ only, or a busy server would drown **(code)**. The VRAM preempt writes the same 
 `by: "vram_preempt"`, so a benchmark reads both kinds of victim from one log **(test)**.
 
 `GET /v1/status` carries a `"priority"` block **only while the lane is on**: `enabled`, `now_served`, `now_cuts`,
-`now_cuts_refused_protected`, `vram_cuts`, `server_requeues`, `resume_credit_hits`, `resume_credit_misses`,
-`streak_skips`, `longest_now_wait_ms` **(test)**.
+`now_cuts_refused_protected`, `now_cuts_refused_tool_done`, `vram_cuts`, `server_requeues`, `resume_credit_hits`,
+`resume_credit_misses`, `streak_skips`, `longest_now_wait_ms` **(test)**.
 
 `python tools/stack_live_check.py now --live --yes-cut-requests` runs one end-to-end check against a live server:
 a long streamed generation, one short `now` request in the middle, then it prints the event-log timeline and checks
@@ -119,5 +127,9 @@ a long streamed generation, one short `now` request in the middle, then it print
   tokens, measured). The event log records `cache_n` for exactly this question.
 - Real Claude Code **interactive mode** under a now-cut, on a real model: not tested. Print mode with a fake engine is
   what VRAM_PREEMPT.md measures (Claude Code 2.1.289 retried in all four cut stages).
-- Tool loops: a cut during a tool call can make a client run that tool twice when it resends - the server cannot see
-  this; a harness counts tool executions from its own side **(code)**.
+- Tool loops: cutting once a whole tool-call has streamed out is refused (the cap above), so a double-run should not
+  happen from this lane. What the server cannot see: a client that reorders or re-runs tools on its own, and calls cut
+  mid-stream before any whole call existed - a harness still counts tool executions from its own side **(code)**.
+- A `now` request with pictures: its encode stands in line at rank 3 and no second now may cut it, but while another
+  request runs the now waits for it to finish or be cut normally - the cutting loop lives in generation, not in an
+  image encode **(test: serve/test_priority_now.py)**.

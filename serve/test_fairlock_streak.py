@@ -111,6 +111,33 @@ class StreakOrder(unittest.TestCase):
         self.assertFalse(lock.locked())
 
 
+class StaleStreakM1(unittest.TestCase):
+    """M1 (review-B): the streak count may not outlive the waiter that justified it - one lone now must never be
+    delayed behind an ordinary request because three older now turns are still counted."""
+
+    def test_a_streak_full_line_that_empties_does_not_jump_the_next_lone_now(self):
+        lock = FairLock(max_streak=3)
+        lock.acquire()                                   # H
+        n1, n2, n3 = lock.enter(3), lock.enter(3), lock.enter(3)
+        w = lock.enter()                                 # the ordinary waiter that makes the streak count
+        lock.release()                                   # grant 1: n1, streak 1 ...
+        take_and_release(self, lock, n1)                 # ... grant 2: n2, streak 2 ...
+        self.assertEqual(granted_place([n1, n2, n3, w]), n2)
+        take_and_release(self, lock, n2)                 # ... grant 3: n3, streak 3 - now at the cap
+        self.assertEqual((lock.streak_skips, [q.rank for q in lock._line]), (0, [0]))
+        w.cancel()                                       # the waiter leaves while n3 still holds the turn
+        take_and_release(self, lock, n3)                 # its release sees an empty line: a stale count would live on
+        self.assertFalse(lock.locked())
+
+        lock.acquire()                                   # H2 starts while nothing waits
+        na = lock.enter(3)                               # one lone now ...
+        w2 = lock.enter()                                # ... and one ordinary request behind it
+        lock.release()
+        first = granted_place([na, w2])
+        self.assertEqual(first, na, "a stale streak must not hand a lone now's turn to the ordinary line")
+        self.assertEqual(lock.streak_skips, 0)
+
+
 class StreakDefaults(unittest.TestCase):
     def test_a_plain_FairLock_behaves_exactly_as_before(self):
         # the serve/test_fairlock.py rank walk: ranks order the line, nothing is ever redirected

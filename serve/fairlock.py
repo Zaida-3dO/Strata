@@ -67,6 +67,10 @@ class Place:
                     lock._line.remove(self)
                 except ValueError:
                     pass
+                # the place that justified a streak may just have left it: with no lower-rank waiter in the line an
+                # old full count must not skip the next lone capped-rank grant (M1)
+                if not any(q.rank < lock.capped_rank for q in lock._line):
+                    lock._streak = 0
 
     def ahead(self) -> int:
         """How many requests are before this one: the one running plus the waiters in front of it."""
@@ -111,6 +115,7 @@ class FairLock:
         with self._mutex:
             if not self._held and not self._line:
                 self._held = True
+                self._streak = 0      # nobody waited: the old run of capped grants is over (M1)
                 place.granted = True
                 place.event.set()
             elif rank <= 0 or not self._line or self._line[-1].rank >= rank:
@@ -146,6 +151,7 @@ class FairLock:
     def _pass_on_locked(self) -> None:
         if not self._line:
             self._held = False
+            self._streak = 0          # an emptied line ends any run of capped grants (a later lone now must wait its turn for nobody)
             return
         nxt = self._line[0]
         if self.max_streak > 0:

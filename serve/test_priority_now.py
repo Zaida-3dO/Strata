@@ -353,9 +353,55 @@ class EventRingAndStatus(Lane):
         self.assertEqual((arrived["prompt_tokens"] > 0, isinstance(arrived["ihash"], str)), (True, True))
         status = http_get(self.port, "/v1/status")[1]["priority"]
         self.assertTrue(status["enabled"])
-        for key in ("now_served", "now_cuts", "now_cuts_refused_protected", "vram_cuts", "server_requeues",
-                    "resume_credit_hits", "resume_credit_misses", "streak_skips", "longest_now_wait_ms"):
+        for key in ("now_served", "now_cuts", "now_cuts_refused_protected", "now_cuts_refused_tool_done", "vram_cuts",
+                    "server_requeues", "resume_credit_hits", "resume_credit_misses", "streak_skips",
+                    "longest_now_wait_ms"):
             self.assertIn(key, status)
+
+
+class ToolDoneCallNotCuttableD1(Lane):
+    """D1 (review-B): once a whole tool-call has streamed out, an agent may already have run it; cutting would make
+    its retry run the tool a second time.  A waiting now must wait for that turn."""
+    plans = [{"text": SHORT, "delay": 0.0}]
+
+    def test_d1_a_turn_whose_tool_call_completed_refuses_the_now_cut(self):
+        cancel = threading.Event()
+        me = server.Holder("tool-turn")
+        me.sent = me.answered = True
+        me.tool_done = True                          # the tool_use block closed whole
+        self.svc.hold(cancel, me)
+        try:
+            self.assertEqual(self.svc.preempt_cut(by_now=True, by="now-1"), [])
+            self.assertFalse(cancel.is_set(), "the tool turn must not be cancelled")
+        finally:
+            self.svc.unhold(cancel)
+        self.assertEqual([e["why"] for e in self.now_events("cut_refused")], ["tool_done"])
+        self.assertEqual((self.svc.now_cuts_refused_tool_done, self.svc.now_cuts), (1, 0))
+        # control: the same holder without the flag IS cut - the refusal comes from tool_done alone
+        cancel2 = threading.Event()
+        plain = server.Holder("no-tool-turn")
+        plain.sent = plain.answered = True
+        self.svc.hold(cancel2, plain)
+        try:
+            self.assertEqual(self.svc.preempt_cut(by_now=True, by="now-2"), ["no-tool-turn"])
+            self.assertTrue(cancel2.is_set())
+        finally:
+            self.svc.unhold(cancel2)
+
+
+class NowPictureEncodeIsANowM3(Lane):
+    """M3 (review-B): a now request's picture encode is held as a now, so a second now may not cut it either."""
+    plans = [{"text": SHORT, "delay": 0.0}]
+
+    def test_m3_a_second_now_never_cuts_a_now_running_its_encode(self):
+        cancel = threading.Event()
+        setattr(cancel, server.PRIORITY_ATTR, "now")
+        with self.svc._turn(cancel=cancel, cuttable=True):
+            holder = next(iter(self.svc.turn_holders.values()))
+            self.assertTrue(holder.now, "the encode must be held as a now: never-now-by-now covers encodes too")
+            self.assertEqual(self.svc.preempt_cut(by_now=True, by="second-now"), [])
+            self.assertFalse(cancel.is_set(), "the encode keeps running")
+        self.assertEqual([e["why"] for e in self.now_events("cut_refused")], ["now"])
 
 
 if __name__ == "__main__":
