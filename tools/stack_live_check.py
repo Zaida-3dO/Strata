@@ -361,7 +361,7 @@ def main():
         sys.exit(2)
     api = Api(a.base or LIVE_BASE, a.key, read_live_key=a.live)
     fails = {"fair": check_fair, "messages": check_messages, "loop": check_loop, "penalty": check_penalty,
-             "preempt": check_preempt}[a.check](api, a)
+             "preempt": check_preempt, "now": check_now}[a.check](api, a)
     sys.exit(1 if fails else 0)
 
 
