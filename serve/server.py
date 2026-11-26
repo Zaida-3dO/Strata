@@ -201,6 +201,10 @@ VISION_START = "<|vision_start|>"
 # broken state that answers one token forever (an issue saw 36,689 tokens of "!"). The config's "repeat_stop_tokens"
 # sets it; 0 turns it off.
 REPEAT_STOP_TOKENS = 256
+# A run of one token while the model is still THINKING is not the end of the request: the thinking is closed with the
+# budget's wrap-up (once per request) so the model answers from what it has.  Of the run, this many copies are kept in the
+# context the model reads again; the rest of the run is dropped from it (the client already has the text it streamed).
+REPEAT_CLOSE_KEEP = 8
 ANSWER_ROOM_MIN_CAP = 1024    # 0.1.45: from this max_tokens on, thinking without a budget is closed early enough to leave room to answer
 DS41_DEFAULT_BUDGET = 32768   # DeepSeek-V4.1 only: the thinking budget when neither the request nor the config names one
 DS41_SMALL_CAP_MIN = 48       # DeepSeek-V4.1 only: from this max_tokens up to ANSWER_ROOM_MIN_CAP, thinking is capped at half of it
@@ -5139,6 +5143,7 @@ class Service:
                                  declared_only=declared_only)
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
+        loop_closed, loop_wrap = False, False           # a run in the thinking was answered with the wrap-up (once); this pass ended on one
         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
         stop_list = stop_strings(sampling)
         stops = StopMatcher(stop_list) if stop_list else None
@@ -5302,6 +5307,7 @@ class Service:
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
+                        loop_wrap = False
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
                         opens = False                   # the thinking is over: write the forced call's opening
                         try:
@@ -5340,6 +5346,13 @@ class Service:
                                 run_len = run_len + 1 if t == run_tok else 1
                                 run_tok = t
                                 if self.repeat_stop_tokens and run_len >= self.repeat_stop_tokens:
+                                    if (thinking and not loop_closed and not cancel.is_set()
+                                            and parser.state == "reasoning" and parser.clean and not detok.pending()):
+                                        # a loop inside the thinking: close it like a budget that ran out and let the
+                                        # model answer, instead of ending the reply with no answer.  Once only: the
+                                        # next run (in the thinking again, or in the answer) ends the reply as before.
+                                        loop_closed = wrap = loop_wrap = True
+                                        break
                                     repeated = True     # #606: a degenerate output, not an answer: end it here
                                     break
                                 piece = detok.push(t)
@@ -5495,8 +5508,20 @@ class Service:
                         force = None
                         extra = self.tok.encode(text, parse_special=True)
                         if max_new - n - len(extra) < 1:
-                            break                       # no room left to answer: "length", as without a budget
-                        if wrap:
+                            repeated = loop_wrap        # no room left to answer: "length", as without a budget
+                            break
+                        if loop_wrap:
+                            # the run is not reasoning worth keeping: the model reads only a few copies of it
+                            same = 0
+                            while same < len(seg) and seg[-1 - same] == run_tok:
+                                same += 1
+                            if same > REPEAT_CLOSE_KEEP:
+                                del seg[len(seg) - same + REPEAT_CLOSE_KEEP:]
+                            print(f"[strata] the thinking repeated one token ({self.tok.decode([run_tok])!r}) {run_len} "
+                                  f"times in a row: wrapping up the thinking so the model answers (kept "
+                                  f"{min(same, REPEAT_CLOSE_KEEP)} of the {same} copies in its context)", flush=True)
+                            run_tok, run_len = None, 0  # the answer starts a new count
+                        elif wrap:
                             print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
@@ -8099,7 +8124,9 @@ FAMILY_MODEL_NAMES = {"qwen4exp": "qwen3.8-flash-next", "qwen35moe": "qwen3.6-35
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
 MODEL_CARD_SAMPLING = {
     # Qwen3.8-Flash-Next (and Gyro, the same base model)
-    "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+    # (thinking's presence_penalty 1.5 is not the card's: measured 24 Nov 2026, 0 runs in 16 ended in a thinking loop with
+    # it against 2 in 16 without; it is the one change that shortened runaway thinking - the card's thinking set has none)
+    "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
     # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
