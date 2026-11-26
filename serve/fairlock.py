@@ -81,10 +81,24 @@ class Place:
 
 
 class FairLock:
-    def __init__(self):
+    """A first-come lock with ranks, and an optional cap on how long one rank may keep the line.
+
+    `max_streak` (0: no cap, the default and byte-identical to the plain behaviour) and `capped_rank` (the rank the cap
+    applies to): when the head of the line has that rank and some place with a lower rank is waiting, at most
+    `max_streak` grants in a row may go to it; the next grant then goes to the first waiting lower-rank place instead,
+    so a chain of high-rank requests (the priority "now" lane) cannot hold off the ordinary line for ever.  The streak
+    counts only grants made while a lower rank actually waits (an unbroken queue at one rank is not starvation), resets
+    when a grant goes to another rank or no lower rank waits, and never touches a head above `capped_rank` (a VRAM
+    resize outranks everything).  `streak_skips` counts the grants the cap redirected."""
+
+    def __init__(self, max_streak: int = 0, capped_rank: int = 3):
         self._mutex = threading.Lock()
         self._held = False
         self._line: collections.deque[Place] = collections.deque()
+        self.max_streak = max_streak          # 0: the cap is off (every pre-lane call and test)
+        self.capped_rank = capped_rank        # the rank whose streak is capped (the lane's NOW_RANK)
+        self._streak = 0                      # consecutive grants to capped_rank while a lower rank waited
+        self.streak_skips = 0                 # grants the cap redirected to a lower-rank place
 
     def enter(self, rank: int = 0) -> Place:
         """Take a place in the line.  If the lock is free and nobody waits, the place already holds the turn.
@@ -130,12 +144,32 @@ class FairLock:
             self._pass_on_locked()
 
     def _pass_on_locked(self) -> None:
-        if self._line:
-            nxt = self._line.popleft()
-            nxt.granted = True              # _held stays True: the turn goes straight to the first waiter
-            nxt.event.set()
-        else:
+        if not self._line:
             self._held = False
+            return
+        nxt = self._line[0]
+        if self.max_streak > 0:
+            lower = next((i for i, p in enumerate(self._line) if p.rank < self.capped_rank), None)
+            if nxt.rank == self.capped_rank:
+                if lower is not None and self._streak >= self.max_streak:
+                    # the cap hit: the first waiting lower-rank place takes this grant instead of the head
+                    nxt = self._line[lower]
+                    del self._line[lower]
+                    self._streak = 0
+                    self.streak_skips += 1
+                else:
+                    self._line.popleft()
+                    self._streak = self._streak + 1 if lower is not None else 0
+            elif nxt.rank < self.capped_rank:
+                self._line.popleft()        # an ordinary or requeued turn: its run of capped grants is over
+                self._streak = 0
+            # a head above capped_rank (the VRAM resize): granted as before, never counted and never skipped
+            else:
+                self._line.popleft()
+        else:
+            self._line.popleft()
+        nxt.granted = True                  # _held stays True: the turn goes straight to this place
+        nxt.event.set()
 
     def locked(self) -> bool:
         return self._held
